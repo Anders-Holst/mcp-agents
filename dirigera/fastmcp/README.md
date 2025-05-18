@@ -4,13 +4,14 @@ The Dirigera MCP Server is an IoT device management server that interfaces with 
 
 ## How to Run
 
-You will have to setup a MCP LLM system - either Claude Desktop or MCP-CLI and configure them to use this server. You can also use the MCP Inspector to test the server.
+You will have to setup a MCP LLM system - either Claude Desktop MCP-CLI or similar and configure them to use this server. You can also use the MCP Inspector to test the server.
+
+There are also some basic examples in the pydanticai folder on how to use the server for mcp automation using an llm.
 
 ```bash
 npx @modelcontextprotocol/inspector uv --directory . run dirigeramcp.py
 ```
 Assuming that you have the config file in the same directory as the dirigeramcp.py file.
-
 
 ## Configuration
 
@@ -32,7 +33,7 @@ In Claude and other tools you will need something like this in your config.json:
       "command": "uv",
       "args": [
         "--directory",
-        "/Users/joakimeriksson/work/ai-smarthome/dirigera/fastmcp",
+        "/Users/joakimeriksson/work/mcp-agents/dirigera/fastmcp",
         "run",
         "dirigeramcp.py"
       ]
