@@ -1,0 +1,10 @@
+[project]
+name = "githubmcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.3.4",
+    "requests>=2.32.3",
+]
