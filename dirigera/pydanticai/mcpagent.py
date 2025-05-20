@@ -33,7 +33,7 @@ model = OpenAIModel(
 )
 
 # Create and configure the agent
-agent = Agent(model, mcp_servers=[server], system_prompt="You are a helpful assistant that can control smart home devices.")
+agent = Agent(model, mcp_servers=[server], system_prompt="You are a helpful assistant that can control smart home devices. The house has a sofa where light lampa2 is positioned.")
 
 # Example chat automation of Lamp control
 import asyncio
@@ -42,7 +42,7 @@ async def main():
     async with agent.run_mcp_servers():
         result = await agent.run("list my lights")
         print(result)
-        result = await agent.run("Toggle the status of the lamp at the couch (Soffa)", message_history=result.new_messages())
+        result = await agent.run("Toggle the status of the lamp at the couch (Sofa)", message_history=result.new_messages())
         print(result)
         # Start an Agent CLI
         await agent.to_cli()
