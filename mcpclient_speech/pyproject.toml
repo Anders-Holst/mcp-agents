@@ -1,0 +1,14 @@
+[project]
+name = "mcpscreen"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai",
+    "pyniryo2",
+    "pyyaml",
+    "fastmcp>=2.3.4",
+    "matplotlib",
+    "pyaudio",
+]

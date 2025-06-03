@@ -1,0 +1,13 @@
+[project]
+name = "candytron_mcp"
+version = "0.1.0"
+description = "Candytron 4000, as an MCP service"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pyniryo2",
+    "pyyaml",
+    "opencv-python",
+#    "ultralytics",
+    "fastmcp>=2.3.4",
+]
