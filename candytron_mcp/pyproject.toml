@@ -5,9 +5,9 @@ description = "Candytron 4000, as an MCP service"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "pyniryo2",
+    "pyniryo",
     "pyyaml",
     "opencv-python",
-#    "ultralytics",
+    "ultralytics",
     "fastmcp>=2.3.4",
 ]

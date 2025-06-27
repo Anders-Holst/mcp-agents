@@ -1,13 +1,10 @@
 import os
-import re
-from threading import Event
 
 import yaml
-from pyniryo2 import *
-from pyniryo2 import PoseObject
+from pyniryo import *
 
 DEFAULT_ROBOT_IP = '10.10.10.10'
-HOME_POSE = PoseObject(x=0.1340, y=-0.0001, z=0.1649, roll=0.002, pitch=1.006, yaw=-0.001)
+HOME_POSE = PoseObject(x=0.1340, y=-0.0001, z=0.1649, roll=0.002, pitch=1.006, yaw=-0.001, metadata=PoseMetadata.v1())
 BASE_POSE_FILE = 'base-saved-poses.yaml'
 LOCAL_POSE_FILE = 'local-saved-poses.yaml'
 
@@ -15,37 +12,35 @@ class Ned2:
     """
     Niryo Ned2 robot arm support object
     """
+    robot: NiryoRobot | None
+
     def __init__(self, robot_ip: str = DEFAULT_ROBOT_IP):
         self._host = robot_ip
-        self._setup_event = Event()
-        self._move_event = Event()
-        self._has_errors = False
         self._current_pose = HOME_POSE
-        self._hold_torque = 30
+        self._hold_torque = 100
+        self._manual_pick_and_place = False
+        # Assume the default is 100 %
+        self._arm_max_velocity = 100
         self.robot = None
         self.verbose = True
         self._pose_file = LOCAL_POSE_FILE
         self.base_poses = self._load_poses_from_yaml(BASE_POSE_FILE)
         self.poses = self._load_poses_from_yaml(self._pose_file)
 
-    def open(self):
+    def open(self) -> bool:
         self.robot = NiryoRobot(self._host)
-        success = self._call_setup(self.robot.arm.calibrate_auto,
-                                   self.__calibrate_success_callback,
-                                   self.__calibrate_failure_callback)
-        if success:
-            success = self._call_setup(self.robot.tool.update_tool,
-                                       self.__update_tool_success_callback,
-                                       self.__update_tool_failure_callback)
-        if not success:
-            self.robot = None
-        return success
+        self.robot.calibrate_auto()
+        self.robot.update_tool()
+        return True
 
     def close(self):
         robot = self.robot
         self.robot = None
         if robot:
-            robot.arm.go_to_sleep()
+            if robot.collision_detected:
+                robot.clear_collision_detected()
+            robot.go_to_sleep()
+            robot.close_connection()
 
     def is_open(self):
         return self.robot is not None
@@ -60,16 +55,16 @@ class Ned2:
         return False
 
     def hardware_status(self):
-        return self.robot.arm.hardware_status() if self.robot else 'Not connected'
+        return self.robot.get_hardware_status() if self.robot else 'Not connected'
 
-    def joints_state(self):
+    def get_joints(self):
         if self._check_offline():
             return None
-        return self.robot.arm.joints_state() if self.robot else None
+        return self.robot.get_joints() if self.robot else None
 
     def get_pose(self, name: str=None) -> PoseObject | None:
         if name is None:
-            return self.robot.arm.get_pose() if self.robot else self._current_pose
+            return self.robot.get_pose() if self.robot else self._current_pose
         p = self.poses.get(name, None)
         if p:
             return p
@@ -82,7 +77,7 @@ class Ned2:
         return None
 
     def set_pose(self, name: str) -> bool:
-        """Save current pose locally with the specified name"""
+        """Save the current pose locally with the specified name"""
         if name is None:
             return False
         self.poses[name] = self.get_pose()
@@ -114,44 +109,86 @@ class Ned2:
     def get_poses(self) -> dict[str, PoseObject]:
         return {**self.base_poses, **self.poses}
 
-    def move_pose(self, pose, title=None) -> bool:
-        return self._move_offline(pose, title) if self.is_offline() else self._move(self.robot.arm.move_pose, pose, title)
+    def move_pose(self, pose: PoseObject, title: str='') -> bool:
+        if self.is_offline():
+            return self._move_offline(pose, title)
+        if title:
+            print('Ned2: Move to', title)
+        self.robot.move(pose)
+        self._current_pose = self.robot.get_pose()
+        if title:
+            print('Ned2:  move done. Pose is', self.pose_to_str(self._current_pose))
+        return True
 
-    def move_joints(self, joints, title=None) -> bool:
+    def move_joints(self, joints: JointsPosition, title: str='') -> bool:
         if self._check_offline():
             return False
-        return self._move(self.robot.arm.move_joints, joints, title)
+        if title:
+            print('Ned2: Move to', title)
+        self.robot.move(joints)
+        self._current_pose = self.robot.get_pose()
+        if title:
+            print('Ned2:  move done. Pose is', self.pose_to_str(self._current_pose))
+        return True
 
     def move_to_home_pose(self):
         if self.is_offline():
             self._current_pose = HOME_POSE
         else:
-            self.robot.arm.move_to_home_pose()
+            self.robot.move_to_home_pose()
 
     def pick_from_pose(self, pose: PoseObject):
         if self._check_offline():
             return None
-        return self.robot.pick_place.pick_from_pose(pose)
+        return self.robot.pick(pose)
 
     def place_from_pose(self, pose: PoseObject):
         if self._check_offline():
             return None
-        return self.robot.pick_place.place_from_pose(pose)
+        return self.robot.place(pose)
 
-    def pick_and_place(self, source_pose: PoseObject, target_pose: PoseObject):
+    def pick_and_place(self, source_pose: PoseObject, target_pose: PoseObject, verbose: bool = False):
         if self._check_offline():
             return None
-        return self.robot.pick_place.pick_and_place(source_pose, target_pose)
+        if self._manual_pick_and_place:
+            height_offset = 0.07
+            pick_pose_high = source_pose.copy_with_offsets(z_offset=height_offset)
+            pick_pose_high.metadata = source_pose.metadata
+            place_pose_high = target_pose.copy_with_offsets(z_offset=height_offset)
+            place_pose_high.metadata = target_pose.metadata
+            if verbose:
+                print("Move to", pick_pose_high)
+            self.robot.move(pick_pose_high)
+            self.open_gripper()
+            if verbose:
+              print("Move to", source_pose)
+            self.robot.move(source_pose)
+            self.close_gripper()
+            if verbose:
+                print("Move to", pick_pose_high)
+            self.robot.move(pick_pose_high)
+            if verbose:
+                print("Move to", place_pose_high)
+            self.robot.move(place_pose_high)
+            if verbose:
+                print("Move to", target_pose)
+            self.robot.move(target_pose)
+            self.open_gripper()
+            if verbose:
+                print("Move to", place_pose_high)
+            return self.robot.move(place_pose_high)
+        # Pick and place handled by the robot
+        return self.robot.pick_and_place(source_pose, target_pose)
 
     def open_gripper(self):
         if self._check_offline():
             return None
-        return self.robot.tool.open_gripper()
+        return self.robot.open_gripper(hold_torque_percentage=self._hold_torque)
 
     def close_gripper(self):
         if self._check_offline():
             return None
-        return self.robot.tool.close_gripper(hold_torque_percentage=self._hold_torque)
+        return self.robot.close_gripper(hold_torque_percentage=self._hold_torque)
 
     def get_hold_torque(self):
         """Returns the current gripper hold torque in percent"""
@@ -159,75 +196,44 @@ class Ned2:
 
     def set_hold_torque(self, percent):
         """Set the gripper hold torque in percent"""
-        if self._check_offline():
-            return False
         if 0 < percent <= 100:
             self._hold_torque = percent
             return True
         return False
 
-    def get_max_speed(self):
-        if self._check_offline():
-            return 0
-        return self.robot.arm.get_arm_max_velocity()
+    def get_manual_pick_and_place(self) -> bool:
+        """Returns if pick-and-place is handled manually or by robot"""
+        return False if self._check_offline() else self._manual_pick_and_place
 
-    def set_max_speed(self, percentage):
-        if self._check_offline() and 0 < percentage <= 100:
-            self.robot.arm.set_arm_max_velocity(percentage)
+    def set_manual_pick_and_place(self, manual: bool) -> bool:
+        """Set if manual pick-and-place should be used or not"""
+        if self._check_offline():
+            return False
+        self._manual_pick_and_place = manual
+        return True
+
+    def get_max_arm_velocity(self) -> int:
+        """Returns the current arm maximum velocity in percent"""
+        return 0 if self._check_offline() else self._arm_max_velocity
+
+    def set_max_arm_velocity(self, percent):
+        """Set the arm maximum velocity in percent"""
+        if self._check_offline():
+            return False
+        if 0 < percent <= 100:
+            self._arm_max_velocity = percent
+            self.robot.set_arm_max_velocity(percent)
             return True
         return False
 
-    def _call_setup(self, setup_function, success_callback, failure_callback) -> bool:
-        self._setup_event.clear()
-        setup_function(callback=success_callback, errback=failure_callback)
-        self._setup_event.wait(30)
-        return self._setup_event.is_set() and not self._has_errors
+    @property
+    def collision_detected(self):
+        return self.robot.collision_detected if self.robot else False
 
-    def __calibrate_success_callback(self, result):
-        if self.verbose:
-            print('Ned2: Calibrate:', result['message'])
-        self._setup_event.set()
-
-    def __calibrate_failure_callback(self, result):
-        self._has_errors = True
-        print('Ned2: Error: Calibrate:', result['message'])
-        self._setup_event.set()
-
-    def __update_tool_success_callback(self, result):
-        if self.verbose:
-            print('Ned2: Update Tool:', result['message'])
-        self._setup_event.set()
-
-    def __update_tool_failure_callback(self, result):
-        self._has_errors = True
-        print('Ned2: Error: Update Tool:', result['message'])
-        self._setup_event.set()
-
-    def __move_callback(self, result):
-        if result['status'] == 1:
-            if self.verbose:
-                print('Ned2:  move successful:', result['message'])
-        else:
-            self._has_errors = True
-            print('Ned2:  Error: move failed:', result)
-        self._move_event.set()
-
-    def _move(self, move_function, target, title=None):
-        self._has_errors = False
-        self._move_event.clear()
-        if title is not None:
-            print('Ned2: Move to', title)
-        move_function(target, callback=self.__move_callback)
-        self._move_event.wait(20)
-        if self._has_errors:
-            return False
-        if not self._move_event.is_set():
-            print("*** timeout")
-            return False
-        self._current_pose = self.robot.arm.get_pose()
-        if title is not None and self.robot:
-            print('Ned2:  move done. Pose is', self.pose_to_str(self._current_pose))
-        return True
+    def clear_collision_detected(self):
+        if self.is_open() and self.robot.collision_detected:
+            self.robot.clear_collision_detected()
+            self.move_to_home_pose()
 
     def _move_offline(self, pose, title=None):
         if title is not None:
@@ -274,7 +280,7 @@ class Ned2:
     @staticmethod
     def _pose_from_list(p) -> PoseObject:
         """Convert a list of floats to a pose object."""
-        return PoseObject(p[0], p[1], p[2], p[3], p[4], p[5])
+        return PoseObject(p[0], p[1], p[2], p[3], p[4], p[5], metadata=PoseMetadata.v1())
 
     @staticmethod
     def _list_from_pose(pose: PoseObject):
@@ -286,11 +292,11 @@ class Ned2:
         return {
             key: self._list_from_pose(value)
             for key, value in poses.items()
-        }
+        } if poses else {}
 
     def _convert_values_to_poses(self, poses):
-        """Convert a dict with list of floats to a dict with pose objects."""
+        """Convert a dict with a list of floats to a dict with pose objects."""
         return {
             key: self._pose_from_list(value)
             for key, value in poses.items()
-        }
+        } if poses else {}
