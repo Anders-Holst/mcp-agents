@@ -53,7 +53,13 @@ def _async_ned_call(args: dict) -> None:
     elif op == 'move':
         src = args['from']
         dst = args['to']
-        ned.pick_and_place(src, dst)
+        try:
+            ned.pick_and_place(src, dst)
+        except Exception as e:
+            print(f"Failed to move {e}")
+            if ned.collision_detected:
+                ned.clear_collision_detected()
+                args['next'] = 'home'
         if 'next' in args and args['next'] == 'home':
             ned.move_to_home_pose()
     else:
