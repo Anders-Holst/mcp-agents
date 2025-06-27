@@ -14,14 +14,13 @@ mcp = FastMCP("Candytron 4000")
 use_robot = True
 use_camera = True
 
-#@mcp.prompt()
-@mcp.resource("url://service_name")
+@mcp.resource("url://get_service_name")
 def get_service_name() -> str:
     """Return the name of the provided service"""
     return mcp.name
 
 @mcp.resource("url://service_init")
-def init_service() -> bool:
+def service_init() -> bool:
     """Initialize the service. Is called before the first tool call from the client."""
     init_ned(use_robot=use_robot)
     print('Initialized robot arm: Niryo Ned 2')
@@ -44,7 +43,7 @@ def init_service() -> bool:
     return True
 
 @mcp.resource("url://service_exit")
-def exit_service() -> bool:
+def service_exit() -> bool:
     """Clean up after the service. Is called when the current client is shutting down."""
     exit_ned()
     exit_cam()

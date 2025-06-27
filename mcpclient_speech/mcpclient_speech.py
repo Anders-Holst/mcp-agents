@@ -19,7 +19,7 @@ from eyewindow import *
 from record import *
 
 ollama_config = {
-    "model": "llama3.1",
+    "model": "PetrosStav/gemma3-tools:12b",
     "base_url": "http://localhost:11434/v1/",
     "api_key": "ollama"
 }
@@ -107,10 +107,6 @@ async def system_message(client, lang):
         txt = "You are a helpful assistant that can control various devices."
     return {"role": "system", "content": txt}
 
-#        cpr = await client.read_resource("url://service_prompt")
-#        cpr = cpr[0].text
-#    sysprompt = {"role": "system", "content": cpr}
-
 async def augmentation_message(client, lang):
     if has_augprompt:
         if has_augprompt_lang:
@@ -180,11 +176,11 @@ async def main():
         print("\nAvailable resources:")
         for res in ress:
             print(res)
-            if res.name == 'url://service_name':
+            if res.name == 'get_service_name':
                 has_name = True
-            if res.name == 'url://service_init':
+            elif res.name == 'service_init':
                 has_init = True
-            if res.name == 'url://service_exit':
+            elif res.name == 'service_exit':
                 has_exit = True
         
         prompts = await client.list_prompts()
@@ -211,7 +207,8 @@ async def main():
 
         make_nonblocking(sys.stdin)
 
-        if init_audio(microphone_name="sof-hda-dsp", sample_rate=16000):
+        #if init_audio(microphone_name="sof-hda-dsp", sample_rate=16000):
+        if init_audio():
             print('Initialized speech recognition and synthesis')
         else:
             print('Error: failed to initialize audio')

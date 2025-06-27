@@ -6,8 +6,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "openai",
-    "pyniryo2",
-    "pyyaml",
     "fastmcp>=2.3.4",
     "matplotlib",
     "pyaudio",
