@@ -1,0 +1,23 @@
+# Config files with tokens
+config.toml
+*-config.toml
+*.toml~
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.python-version
+
+# Editor backups
+*~
+
+# Environment
+env.sh
+.env
+
+# Locks (optional - can be committed)
+uv.lock
+
+# Output files
+*.png

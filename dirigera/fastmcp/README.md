@@ -1,17 +1,33 @@
 # Dirigera MCP Server (FastMCP version)
 
-The Dirigera MCP Server is an IoT device management server that interfaces with the Dirigera platform. It allows users to manage and interact with various IoT devices, such as environment sensors, lights and outlets.
+The Dirigera MCP Server is an IoT device management server that interfaces with the IKEA DIRIGERA platform. It allows users to manage and interact with various IoT devices, such as environment sensors, lights and outlets.
+
+## Transports
+
+| Transport | Use Case | Command |
+|-----------|----------|---------|
+| `stdio` | Local (Claude Desktop, MCP CLI) | `uv run dirigeramcp.py` |
+| `streamable-http` | Remote (recommended) | `uv run dirigeramcp.py --transport streamable-http --host 0.0.0.0` |
+| `sse` | Remote (legacy) | `uv run dirigeramcp.py --transport sse --host 0.0.0.0` |
 
 ## How to Run
 
-You will have to setup a MCP LLM system - either Claude Desktop MCP-CLI or similar and configure them to use this server. You can also use the MCP Inspector to test the server.
-
-There are also some basic examples in the pydanticai folder on how to use the server for mcp automation using an llm.
-
+### Local (stdio)
 ```bash
 npx @modelcontextprotocol/inspector uv --directory . run dirigeramcp.py
 ```
-Assuming that you have the config file in the same directory as the dirigeramcp.py file.
+
+### Remote Server (streamable-http - recommended)
+```bash
+uv run dirigeramcp.py --transport streamable-http --host 0.0.0.0 --port 8000
+# Server available at http://<your-ip>:8000/mcp
+```
+
+### Remote Server (sse)
+```bash
+uv run dirigeramcp.py --transport sse --host 0.0.0.0 --port 8000
+# Server available at http://<your-ip>:8000/sse
+```
 
 ## Configuration
 

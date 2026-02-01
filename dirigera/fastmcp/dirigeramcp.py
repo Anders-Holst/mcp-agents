@@ -11,7 +11,7 @@ client = None
 
 @mcp.tool()
 def get_environment_sensors() -> list:
-    """Lists all environment sensors with their current data such as temperature, humidity, etc."""
+    """Lists all environment sensors with their current data such as temperature, humidity, CO2, etc."""
     return [
         {
             'id': sensor.id,
@@ -20,6 +20,7 @@ def get_environment_sensors() -> list:
             'humidity': sensor.attributes.current_r_h,
             'pm2.5': sensor.attributes.current_p_m25,
             'voc': sensor.attributes.voc_index,
+            'co2': getattr(sensor.attributes, 'current_c_o2', None),
         }
         for sensor in client.get_environment_sensors()
     ]
@@ -93,15 +94,19 @@ def set_light_color(name: str, color_saturation: float, color_hue: float) -> str
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Dirigera MCP Server for IoT device management')
     parser.add_argument('--config-path', default="../config.toml", help='Path to Dirigera server configuration file (TOML format)')
-    parser.add_argument('--host', default="127.0.0.1", help='Host to bind to')
+    parser.add_argument('--host', default="127.0.0.1", help='Host to bind to (use 0.0.0.0 for remote access)')
     parser.add_argument('--port', default=8000, type=int, help='Port to bind to')
-    parser.add_argument('--transport', default="stdio", help='Transport to use (stdio, sse or http)')
+    parser.add_argument('--transport', default="stdio", choices=["stdio", "sse", "streamable-http"],
+                        help='Transport: stdio (local), sse (remote), streamable-http (remote, recommended)')
     args = parser.parse_args()
     conf = toml.load(args.config_path)
-    host = conf['dirigera']['host']
+    hub_host = conf['dirigera']['host']
     token = conf['dirigera']['token']
-    client = dirigera.Hub(token=token, ip_address=host)
-    if args.transport != "stdio":
-        mcp.run(transport=args.transport, host=args.host, port=args.port)
+    client = dirigera.Hub(token=token, ip_address=hub_host)
+
+    if args.transport == "streamable-http":
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    elif args.transport == "sse":
+        mcp.run(transport="sse", host=args.host, port=args.port)
     else:
         mcp.run()
