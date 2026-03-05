@@ -121,7 +121,19 @@ async def augmentation_message(client, lang):
 def user_message(prompt):
     return {"role": "user", "content": prompt}
 
-def compose_messages(sysp, mlst, aug, lang):
+def language_message(lang):
+    languages = { "en": "English",
+                  "sv": "Swedish",
+                  "de": "Deutch",
+                  "fr": "French",
+                  "es": "Spanish"}
+    if not lang in languages:
+        lang = 'en'
+    reply_language = languages[lang]
+    msg = f"Reply in {reply_language}!"
+    return {"role": "system", "content": msg}
+    
+def compose_messages(sysp, mlst, aug, langmsg):
     n = 0
     i1 = 0
     i2 = 0
@@ -133,7 +145,8 @@ def compose_messages(sysp, mlst, aug, lang):
             if n == messages_trunclen:
                 i1 = i
                 break
-    return [sysp] + mlst[i1:i2] + ([aug] if aug else []) + mlst[i2:]
+
+    return [sysp] + mlst[i1:i2] + ([aug] if aug else []) + [langmsg] + mlst[i2:]
 
 def clear_messages():
     global messages
@@ -253,6 +266,7 @@ async def main():
         lang = False
         prompt = ""
         txtlang = 'en'
+        langprompt = False
         sysprompt = False
         augprompt = False
         while True:
@@ -298,6 +312,7 @@ async def main():
     
             if newstate == 'processing':
                 if not repeat:
+                    langprompt = language_message(lang)
                     sysprompt = await system_message(client, lang)
                     augprompt = await augmentation_message(client, lang)
                     if augprompt:
@@ -310,7 +325,7 @@ async def main():
 
                 response = openai.chat.completions.create(
                     model=model,
-                    messages=compose_messages(sysprompt, messages, augprompt, lang),
+                    messages=compose_messages(sysprompt, messages, augprompt, langprompt),
                     tools=tools,
                 )
     
