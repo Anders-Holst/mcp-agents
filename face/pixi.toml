@@ -13,6 +13,12 @@ opencv = "*"
 face_recognition = "*"
 face_recognition_models = "*"
 setuptools = "<80"
+python-sounddevice = "*"
+scipy = "*"
+
+[pypi-dependencies]
+piper-tts = "*"
+faster-whisper = "*"
 
 [tasks]
 run = "python main.py"
