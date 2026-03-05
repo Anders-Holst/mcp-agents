@@ -1,0 +1,18 @@
+[project]
+name = "face-recognition"
+version = "0.1.0"
+description = "Face recognition app that learns faces over time"
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[dependencies]
+python = ">=3.11,<3.13"
+dlib = "*"
+numpy = "*"
+opencv = "*"
+face_recognition = "*"
+face_recognition_models = "*"
+setuptools = "<80"
+
+[tasks]
+run = "python main.py"
