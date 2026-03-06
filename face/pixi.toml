@@ -9,16 +9,20 @@ platforms = ["osx-arm64"]
 python = ">=3.11,<3.13"
 dlib = "*"
 numpy = "*"
-opencv = "*"
 face_recognition = "*"
 face_recognition_models = "*"
 setuptools = "<80"
 python-sounddevice = "*"
 scipy = "*"
+opencv = ">=4.13.0,<5"
 
 [pypi-dependencies]
 piper-tts = "*"
 faster-whisper = "*"
+onnxruntime = ">=1.23.2, <2"
+torch = "*"
+torchaudio = "*"
+noisereduce = "*"
 
 [tasks]
 run = "python main.py"
