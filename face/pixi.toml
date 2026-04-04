@@ -23,6 +23,12 @@ onnxruntime = ">=1.23.2, <2"
 torch = "*"
 torchaudio = "*"
 noisereduce = "*"
+pydantic-ai = {version = "*", extras = ["openai"]}
 
 [tasks]
 run = "python main.py"
+vision = "python face_tracker.py"
+listen = "python voice_input.py"
+people = "python people_memory.py"
+speak = "python voice_output.py"
+agent = "python agent.py"
