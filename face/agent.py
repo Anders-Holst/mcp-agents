@@ -11,6 +11,7 @@ Can be run standalone with face_tracker + voice_input + voice_output:
 """
 
 import time
+import asyncio
 import threading
 import logging
 import argparse
@@ -183,38 +184,77 @@ Rules: Reply in 1-2 short sentences. Match their language. No markdown or emojis
 
 
 class ConversationLLM:
-    """LLM-powered conversation engine using pydantic-ai + Ollama."""
+    """LLM-powered conversation engine using pydantic-ai + Ollama.
+
+    Supports MCP toolsets so the LLM can call external tools (smart home,
+    search, etc.).  Pass MCP servers via the ``mcp_servers`` parameter —
+    see ``mcp_client.py`` for how to configure them.
+    """
 
     def __init__(self, model_name: str = "qwen3:8b",
-                 ollama_url: str = "http://localhost:11434/v1"):
+                 ollama_url: str = "http://localhost:11434/v1",
+                 mcp_servers: Optional[list] = None):
         provider = OpenAIProvider(base_url=ollama_url, api_key="ollama")
         model = OpenAIChatModel(model_name, provider=provider)
         self._model = model
         self._model_name = model_name
+        self._mcp_servers = mcp_servers or []
+
+        # Background event loop for async MCP operations
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._loop.run_forever, daemon=True, name="llm-loop")
+        self._loop_thread.start()
+
+        if self._mcp_servers:
+            logger.info(f"ConversationLLM: {len(self._mcp_servers)} MCP toolset(s) active")
+
+    def stop(self):
+        """Shut down the background event loop."""
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._loop_thread.join(timeout=5)
 
     def _make_agent(self) -> PydanticAgent:
-        """Create a fresh agent with current system prompt."""
+        """Create a pydantic-ai agent with current system prompt + MCP toolsets."""
         system = SYSTEM_PROMPT.format(time=datetime.now().strftime("%H:%M"))
-        return PydanticAgent(self._model, system_prompt=system)
+        return PydanticAgent(
+            self._model,
+            system_prompt=system,
+            toolsets=self._mcp_servers,
+        )
+
+    # --- Core LLM call (sync wrapper around async) ---
 
     def _call_llm(self, prompt: str, label: str, fallback: str) -> str:
-        """Call the LLM with logging of prompt, response, and timing."""
+        """Call the LLM (with MCP tools if configured). Thread-safe."""
         logger.info(f"[LLM:{label}] model={self._model_name}")
         logger.info(f"[LLM:{label}] prompt:\n{prompt}")
         start = time.time()
         try:
-            agent = self._make_agent()
-            result = agent.run_sync(prompt)
+            future = asyncio.run_coroutine_threadsafe(
+                self._arun(prompt), self._loop)
+            output = future.result(timeout=60)
             elapsed = time.time() - start
-            output = result.output.strip()
             logger.info(f"[LLM:{label}] response ({elapsed:.1f}s): {output}")
-            logger.info(f"[LLM:{label}] usage: {result.usage()}")
             return output
         except Exception as e:
             elapsed = time.time() - start
             logger.warning(f"[LLM:{label}] FAILED after {elapsed:.1f}s: {e}")
             logger.info(f"[LLM:{label}] using fallback: {fallback}")
             return fallback
+
+    async def _arun(self, prompt: str) -> str:
+        """Run a single LLM query, connecting MCP servers if needed."""
+        agent = self._make_agent()
+        if self._mcp_servers:
+            async with agent:
+                result = await agent.run(prompt)
+                return result.output.strip()
+        else:
+            result = await agent.run(prompt)
+            return result.output.strip()
+
+    # --- High-level generation methods ---
 
     def generate_greeting(self, memory: PeopleMemory, track_id: int,
                           emotion: str = "") -> str:
@@ -316,10 +356,11 @@ class Agent:
         logger.info("Agent started (listening paused until first interaction)")
 
     def stop(self):
-        """Stop continuous listening."""
+        """Stop continuous listening and clean up."""
         if self._listener:
             self._listener.stop()
             self._listener = None
+        self.llm.stop()
         self.memory.save_all()
         logger.info("Agent stopped")
 
@@ -620,6 +661,10 @@ def main():
     parser.add_argument("--ollama-url", default="http://localhost:11434/v1")
     parser.add_argument("--en-voice", default="en_US-lessac-medium",
                         help="English TTS voice")
+    parser.add_argument("--mcp-config", default=None,
+                        help="Path to MCP servers JSON config (default: mcp_servers.json)")
+    parser.add_argument("--mcp-server", action="append", default=[],
+                        help="MCP server SSE URL (can be repeated)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -641,7 +686,14 @@ def main():
     memory = PeopleMemory(storage_dir=args.people_dir)
     memory.load()
 
-    llm = ConversationLLM(model_name=args.llm_model, ollama_url=args.ollama_url)
+    from mcp_client import load_servers
+    mcp_servers = load_servers(config_path=args.mcp_config, server_urls=args.mcp_server)
+
+    llm = ConversationLLM(
+        model_name=args.llm_model,
+        ollama_url=args.ollama_url,
+        mcp_servers=mcp_servers,
+    )
     logger.info(f"LLM: {args.llm_model} via {args.ollama_url}")
 
     monitor = AudioMonitor()

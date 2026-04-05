@@ -23,7 +23,7 @@ onnxruntime = ">=1.23.2, <2"
 torch = "*"
 torchaudio = "*"
 noisereduce = "*"
-pydantic-ai = {version = "*", extras = ["openai"]}
+pydantic-ai = {version = "*", extras = ["openai", "mcp"]}
 
 [tasks]
 run = "python main.py"
