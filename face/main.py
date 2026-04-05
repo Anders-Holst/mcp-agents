@@ -1,16 +1,33 @@
+"""
+Face Agent UI — thin visual shell around the Agent.
+
+All intelligence (greetings, responses, name asking, goodbye) lives in
+agent.py.  This file only handles:
+  - OpenCV camera display and face box drawing
+  - Audio meter and event log overlays
+  - Keyboard controls (L=learn, T=talk, C=continuous, A=auto-ask, etc.)
+"""
+
 import cv2
 import numpy as np
 import os
 import time
 import threading
 import logging
+import argparse
 from datetime import datetime
 
-from face_tracker import FaceTracker, FaceDatabase, EmotionDetector, TrackedFace
-from voice_input import VoiceInput, AudioMonitor, ContinuousListener
+from face_tracker import FaceTracker, FaceDatabase, EmotionDetector
+from voice_input import VoiceInput, AudioMonitor
 from voice_output import VoiceOutput
+from people_memory import PeopleMemory
+from agent import Agent, AgentEvent, AgentEventType
+from llm import ConversationLLM
 
-# --- Logging setup ---
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"face_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
@@ -26,6 +43,9 @@ _ch.setLevel(logging.INFO)
 _ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
 logger.addHandler(_ch)
 
+# ---------------------------------------------------------------------------
+# Event log (on-screen ring buffer)
+# ---------------------------------------------------------------------------
 
 class EventLog:
     """In-memory ring buffer of recent log events for on-screen display."""
@@ -52,14 +72,9 @@ class EventLog:
             return list(self._entries[-n:])
 
 
-event_log = EventLog()
-
-PIPER_MODEL_DIR = "piper_models"
-UNKNOWN_ASK_COOLDOWN = 30
-CONVERSATION_DISPLAY_S = 6
-CONTINUOUS_LISTEN = True
-GREETING_COOLDOWN = 60
-
+# ---------------------------------------------------------------------------
+# Drawing helpers
+# ---------------------------------------------------------------------------
 
 def draw_audio_meter(frame, audio_monitor, voice_engine=None):
     h, w = frame.shape[:2]
@@ -94,8 +109,6 @@ def draw_audio_meter(frame, audio_monitor, voice_engine=None):
     db = 20 * np.log10(audio_monitor.rms + 1e-10)
     cv2.putText(frame, f"{db:.0f}dB", (mx - 2, my - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
-    cv2.putText(frame, "VOL", (mx - 2, my + mh + 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (150, 150, 150), 1)
 
     if voice_engine:
         vx = mx + mw + 8
@@ -140,47 +153,69 @@ def draw_audio_meter(frame, audio_monitor, voice_engine=None):
         if lang:
             lang_prob = voice_engine.detected_language_prob
             px = vx + vw + 8
-            lang_text = f"Lang: {lang} ({lang_prob:.0%})"
-            cv2.putText(frame, lang_text, (px, my + 40),
+            cv2.putText(frame, f"Lang: {lang} ({lang_prob:.0%})", (px, my + 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
 
-def get_greeting(face_db, name, emotion=None):
-    """Generate a personalized greeting based on history and emotion."""
-    now = datetime.now()
-    hour = now.hour
-    time_greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 17 else "Good evening"
+LOG_CATEGORY_COLORS = {
+    "face":     (255, 200, 100),
+    "voice":    (100, 255, 100),
+    "action":   (100, 200, 255),
+    "system":   (200, 200, 200),
+    "emotion":  (200, 100, 255),
+    "reasoning":(100, 255, 255),
+    "agent":    (100, 200, 255),
+}
 
-    last_seen = face_db.get_last_seen(name)
-    if last_seen is None:
-        greeting = f"Nice to meet you, {name}!"
-    else:
-        elapsed = now.timestamp() - last_seen
-        if elapsed < 60:
-            greeting = f"Hey again, {name}!"
-        elif elapsed < 3600:
-            mins = int(elapsed / 60)
-            greeting = f"Welcome back, {name}! It's been {mins} minutes."
-        elif elapsed < 86400:
-            hours = int(elapsed / 3600)
-            greeting = f"{time_greeting}, {name}! Haven't seen you in {hours} hour{'s' if hours > 1 else ''}."
-        else:
-            days = int(elapsed / 86400)
-            greeting = f"{time_greeting}, {name}! It's been {days} day{'s' if days > 1 else ''} since I last saw you."
 
-    emotion_comments = {
-        "happy": "You look happy today!",
-        "sad": "You seem a bit down. Hope your day gets better!",
-        "angry": "You look a bit upset. Everything okay?",
-        "surprise": "You look surprised!",
-        "fear": "You look a bit worried.",
-        "disgust": "Rough day?",
-        "neutral": "",
-    }
-    if emotion and emotion in emotion_comments and emotion_comments[emotion]:
-        greeting += " " + emotion_comments[emotion]
+def draw_event_log_window(event_log_inst, max_lines=30, width=700, height=600):
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[:] = (25, 25, 25)
 
-    return greeting
+    entries = event_log_inst.recent(max_lines)
+
+    cv2.rectangle(canvas, (0, 0), (width, 30), (40, 40, 40), cv2.FILLED)
+    cv2.putText(canvas, "EVENT LOG", (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+    entry_count = len(event_log_inst.recent(200))
+    cv2.putText(canvas, f"({entry_count} events)", (width - 130, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+
+    if not entries:
+        cv2.putText(canvas, "No events yet...", (20, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
+        cv2.imshow("Event Log", canvas)
+        return
+
+    line_h = 19
+    y_start = 40
+    for i, entry in enumerate(entries):
+        y = y_start + i * line_h
+        if y + line_h > height:
+            break
+        cat = entry["cat"]
+        color = LOG_CATEGORY_COLORS.get(cat, (180, 180, 180))
+        ts = entry["ts"]
+        msg = entry["msg"]
+        detail = entry.get("detail", "")
+
+        cv2.putText(canvas, ts, (8, y + 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, (100, 100, 100), 1)
+        cv2.putText(canvas, f"[{cat.upper()}]", (72, y + 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, color, 1)
+        max_msg_chars = 40
+        display_msg = msg if len(msg) <= max_msg_chars else msg[:max_msg_chars - 2] + ".."
+        cv2.putText(canvas, display_msg, (150, y + 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (220, 220, 220), 1)
+        if detail:
+            detail_x = 150 + max_msg_chars * 8
+            max_detail = 35
+            display_detail = detail if len(detail) <= max_detail else detail[:max_detail - 2] + ".."
+            cv2.putText(canvas, display_detail, (detail_x, y + 13),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (130, 130, 130), 1)
+        cv2.line(canvas, (8, y + line_h - 1), (width - 8, y + line_h - 1), (40, 40, 40), 1)
+
+    cv2.imshow("Event Log", canvas)
 
 
 def show_overlay(frame, lines, window="Face Recognition"):
@@ -226,181 +261,151 @@ def get_name_from_gui(frame, existing_match=None):
             name += chr(key)
 
 
-PIPER_MODEL_DIR = "piper_models"  # kept for reference, VoiceOutput has its own default
+def draw_faces(frame, tracker):
+    """Draw face boxes, names, emotions, and focus indicator."""
+    faces = tracker.get_visible_faces()
+    focus_id = tracker.focus_track_id
+
+    for rank, face in enumerate(faces):
+        is_focus = (face.track_id == focus_id)
+        name = tracker.get_name(face.track_id)
+        conf = tracker.get_confidence(face.track_id)
+        top, right, bottom, left = face.bbox
+        color = (0, 255, 100) if is_focus else (0, 200, 0) if name else (0, 0, 200)
+        thickness = 4 if is_focus else 2
+
+        cv2.rectangle(frame, (left, top), (right, bottom), color, thickness)
+        label = f"[{rank+1}] {name or '?'} #{face.track_id}"
+        if conf:
+            label += f" {conf:.0f}%"
+        cv2.rectangle(frame, (left, bottom), (right, bottom + 28), color, cv2.FILLED)
+        cv2.putText(frame, label, (left + 4, bottom + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2)
+        if face.emotion and face.emotion != "neutral":
+            cv2.putText(frame, face.emotion, (left, top - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+        if is_focus:
+            cv2.putText(frame, "FOCUS", (left, top - 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 100), 2)
 
 
-def extract_name(text):
-    if not text:
-        return None
-    text = text.strip().strip(".")
-    for prefix in ["my name is", "i'm", "i am", "they call me", "it's", "its",
-                   "hi i'm", "hi i am", "hello i'm", "hello i am",
-                   "hey i'm", "hey i am"]:
-        lower = text.lower()
-        if lower.startswith(prefix):
-            text = text[len(prefix):].strip().strip(".,!")
-            break
-    name = text.split()[0] if text else None
-    if name:
-        name = name.strip(".,!?").capitalize()
-    return name if name and len(name) > 1 else None
-
-
-def draw_listening_indicator(frame, is_listening, voice_status):
-    if not is_listening:
-        return
-    h, w = frame.shape[:2]
-    pulse = int(abs(np.sin(time.time() * 4)) * 8) + 12
-    cx, cy = w - 40, 50
-    cv2.circle(frame, (cx, cy), pulse, (0, 0, 255), -1)
-    cv2.circle(frame, (cx, cy), pulse + 2, (0, 0, 255), 2)
-    cv2.putText(frame, "LISTENING", (cx - 75, cy + 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-
-def draw_conversation(frame, conversation_lines):
-    if not conversation_lines:
-        return
-    h, w = frame.shape[:2]
-    now = time.time()
-    active = [(role, text, ts) for role, text, ts in conversation_lines
-              if now - ts < CONVERSATION_DISPLAY_S]
-    if not active:
-        return
-
-    line_h = 30
-    box_h = len(active) * line_h + 20
-    y_start = h - 50 - box_h
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (10, y_start), (w - 10, y_start + box_h), (0, 0, 0), cv2.FILLED)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-
-    for i, (role, text, ts) in enumerate(active):
-        y = y_start + 22 + i * line_h
-        age = now - ts
-        alpha = min(1.0, (CONVERSATION_DISPLAY_S - age) / 1.0)
-        if role == "system":
-            color = (int(200 * alpha), int(200 * alpha), int(255 * alpha))
-            prefix = ">> "
-        elif role == "heard":
-            color = (int(100 * alpha), int(255 * alpha), int(100 * alpha))
-            prefix = "<< "
-        else:
-            color = (int(200 * alpha), int(200 * alpha), int(200 * alpha))
-            prefix = ""
-        cv2.putText(frame, prefix + text, (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
-
-
-LOG_CATEGORY_COLORS = {
-    "face":     (255, 200, 100),
-    "voice":    (100, 255, 100),
-    "action":   (100, 200, 255),
-    "system":   (200, 200, 200),
-    "emotion":  (200, 100, 255),
-    "reasoning":(100, 255, 255),
-}
-
-
-def draw_event_log_window(event_log_inst, max_lines=30, width=700, height=600):
-    """Render the event log into a separate OpenCV window."""
-    canvas = np.zeros((height, width, 3), dtype=np.uint8)
-    canvas[:] = (25, 25, 25)  # dark background
-
-    entries = event_log_inst.recent(max_lines)
-
-    # Title bar
-    cv2.rectangle(canvas, (0, 0), (width, 30), (40, 40, 40), cv2.FILLED)
-    cv2.putText(canvas, "EVENT LOG", (10, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-    entry_count = len(event_log_inst.recent(200))
-    cv2.putText(canvas, f"({entry_count} events)", (width - 130, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
-
-    if not entries:
-        cv2.putText(canvas, "No events yet...", (20, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
-        cv2.imshow("Event Log", canvas)
-        return
-
-    line_h = 19
-    y_start = 40
-
-    for i, entry in enumerate(entries):
-        y = y_start + i * line_h
-        if y + line_h > height:
-            break
-        cat = entry["cat"]
-        color = LOG_CATEGORY_COLORS.get(cat, (180, 180, 180))
-        ts = entry["ts"]
-        msg = entry["msg"]
-        detail = entry.get("detail", "")
-
-        # Timestamp
-        cv2.putText(canvas, ts, (8, y + 13),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, (100, 100, 100), 1)
-
-        # Category tag
-        tag = f"[{cat.upper()}]"
-        cv2.putText(canvas, tag, (72, y + 13),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, color, 1)
-
-        # Message
-        msg_x = 150
-        max_msg_chars = 40
-        display_msg = msg if len(msg) <= max_msg_chars else msg[:max_msg_chars - 2] + ".."
-        cv2.putText(canvas, display_msg, (msg_x, y + 13),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (220, 220, 220), 1)
-
-        # Detail (dimmer, to the right)
-        if detail:
-            detail_x = msg_x + max_msg_chars * 8
-            max_detail = 35
-            display_detail = detail if len(detail) <= max_detail else detail[:max_detail - 2] + ".."
-            cv2.putText(canvas, display_detail, (detail_x, y + 13),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (130, 130, 130), 1)
-
-        # Subtle separator line
-        cv2.line(canvas, (8, y + line_h - 1), (width - 8, y + line_h - 1), (40, 40, 40), 1)
-
-    cv2.imshow("Event Log", canvas)
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    # --- Face tracker setup ---
-    face_db = FaceDatabase()
+    parser = argparse.ArgumentParser(description="Face Agent UI")
+    parser.add_argument("--db-dir", default="known_faces")
+    parser.add_argument("--people-dir", default="people")
+    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument("--no-auto-ask", action="store_true")
+    parser.add_argument("--no-auto-greet", action="store_true")
+    parser.add_argument("--llm-model", default="qwen3:8b")
+    parser.add_argument("--ollama-url", default="http://localhost:11434/v1")
+    parser.add_argument("--en-voice", default="en_US-lessac-medium")
+    parser.add_argument("--mcp-config", default=None)
+    parser.add_argument("--mcp-server", action="append", default=[])
+    parser.add_argument("--agent-name", default="Face Agent")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s",
+                        datefmt="%H:%M:%S")
+
+    # --- Initialize components ---
+    face_db = FaceDatabase(db_dir=args.db_dir)
     face_db.load()
     emotion_detector = EmotionDetector()
-    tracker = FaceTracker(face_db, emotion_detector,
-                          on_event=lambda cat, msg, detail=None: event_log.add(cat, msg, detail))
+    tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector)
 
-    # --- Voice setup ---
-    voice = VoiceInput()
-    voice.load()
-    tts = VoiceOutput()
-    tts.load()
+    voice_in = VoiceInput()
+    voice_in.load()
+    voice_out = VoiceOutput(model_name=args.en_voice)
+    voice_out.load()
+
+    memory = PeopleMemory(storage_dir=args.people_dir)
+    memory.load()
+
     audio_monitor = AudioMonitor()
     audio_monitor.start()
 
-    event_log.add("system", f"App started, {len(face_db.known_names)} known people",
-                  f"known: {', '.join(face_db.known_names) if face_db.known_names else 'none'}")
-    event_log.add("system", f"Log file: {LOG_FILE}")
-    print(f"Loaded {face_db.encoding_count} encodings for {len(face_db.known_names)} people: {face_db.known_names}")
-    print()
-    print("Controls:")
-    print("  L     - Learn/label face (keyboard)")
-    print("  V     - Voice-ask the selected unknown face")
-    print("  T     - Talk (listen and respond)")
-    print("  C     - Toggle continuous listening")
-    print("  A     - Toggle auto-ask mode for unknown faces")
-    print("  TAB   - Cycle selection between detected faces")
-    print("  D     - Delete face database")
-    print("  Q/ESC - Quit")
-    print()
+    from mcp_client import load_servers
+    mcp_servers, mcp_descriptions = load_servers(
+        config_path=args.mcp_config, server_urls=args.mcp_server)
 
-    cap = cv2.VideoCapture(0)
+    llm = ConversationLLM(
+        model_name=args.llm_model,
+        ollama_url=args.ollama_url,
+        mcp_servers=mcp_servers,
+        mcp_descriptions=mcp_descriptions,
+        agent_name=args.agent_name,
+    )
+
+    agent = Agent(
+        tracker=tracker,
+        voice_input=voice_in,
+        voice_output=voice_out,
+        memory=memory,
+        llm=llm,
+        auto_ask=not args.no_auto_ask,
+        auto_greet=not args.no_auto_greet,
+    )
+
+    # --- Event log (bridge agent events to on-screen log) ---
+    event_log = EventLog()
+    event_log.add("system", f"App started, {len(face_db.known_names)} known people")
+    event_log.add("system", f"Log file: {LOG_FILE}")
+
+    # Bridge face tracker events to the event log
+    from face_tracker import FaceEvent, FaceEventType
+    def on_face_event(event: FaceEvent):
+        p = event.payload
+        if event.type == FaceEventType.FACE_APPEARED:
+            name = getattr(p, 'initial_name', None) or '?'
+            event_log.add("face", f"Appeared: {name} (track {event.track_id})")
+        elif event.type == FaceEventType.FACE_DISAPPEARED:
+            name = getattr(p, 'name', None) or '?'
+            event_log.add("face", f"Left: {name} (track {event.track_id})")
+        elif event.type == FaceEventType.IDENTITY_CONFIRMED:
+            event_log.add("face", f"Identified: {p.name} (track {event.track_id})")
+        elif event.type == FaceEventType.EMOTION_CHANGED:
+            name = getattr(p, 'name', None) or f"track {event.track_id}"
+            event_log.add("emotion", f"{name}: {p.old_emotion} -> {p.new_emotion}")
+    tracker.subscribe(on_face_event)
+
+    # Bridge agent events to the event log
+    def on_agent_event(event: AgentEvent):
+        p = event.payload
+        if event.type == AgentEventType.GREETING:
+            event_log.add("agent", f"Greeting {p.name}", f'"{p.text}"')
+        elif event.type == AgentEventType.GOODBYE:
+            event_log.add("agent", f"Goodbye {p.name}", f'"{p.text}"')
+        elif event.type == AgentEventType.ASKING_NAME:
+            event_log.add("agent", f"Asking name (track {p.track_id})", f'"{p.text}"')
+        elif event.type == AgentEventType.RESPONDING:
+            event_log.add("voice", f"Heard from {p.name or '?'}", f'"{p.heard}"')
+            event_log.add("agent", f"Responding", f'"{p.response}"')
+        elif event.type == AgentEventType.LEARNED_NAME:
+            event_log.add("agent", f"Learned: {p.name}")
+        elif event.type == AgentEventType.NAME_EXTRACT_FAILED:
+            event_log.add("agent", f"Name extract failed", f'"{p.raw_speech}"')
+    agent.subscribe(on_agent_event)
+
+    # --- Start agent ---
+    print("Loading models...")
+    while not voice_in.ready:
+        time.sleep(0.5)
+    while not voice_out.ready:
+        time.sleep(0.5)
+    print("Models loaded. Starting agent.\n")
+
+    agent.start()
+
+    # --- Camera + UI loop ---
+    cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
-        print("Error: Could not open webcam.")
+        logger.error(f"Could not open camera {args.camera}")
         return
 
     cv2.namedWindow("Face Recognition", cv2.WINDOW_NORMAL)
@@ -409,417 +414,123 @@ def main():
     cv2.resizeWindow("Event Log", 700, 600)
     cv2.moveWindow("Event Log", 820, 0)
 
-    selected_track_id = None  # Stable track ID instead of volatile index
-    auto_ask = True
-    asked_tracks = {}  # track_id -> timestamp (cooldown for auto-ask)
-    greeted_recently = {}  # name -> timestamp
-    voice_status = ""
-    voice_busy = False
-    is_listening = False
-    continuous_listen_enabled = CONTINUOUS_LISTEN
-    conversation_lines = []
+    frame_interval = 1.0 / args.fps if args.fps > 0 else 0
+    last_frame = 0.0
 
-    def add_conversation(role, text):
-        conversation_lines.append((role, text, time.time()))
-        cutoff = time.time() - CONVERSATION_DISPLAY_S * 2
-        while conversation_lines and conversation_lines[0][2] < cutoff:
-            conversation_lines.pop(0)
+    print(f"Running at {args.fps} FPS.")
+    print("  L=learn  T=talk  C=continuous  A=auto-ask  TAB=select  D=delete  Q=quit\n")
 
-    def do_speak_and_show(text):
-        add_conversation("system", text)
-        if continuous_listener:
-            continuous_listener.paused = True
-        tts.speak(text)
-        if continuous_listener and continuous_listen_enabled:
-            continuous_listener.paused = False
-
-    def make_on_segment():
-        def _on_seg(text):
-            nonlocal voice_status
-            voice_status = f"Hearing: {text}"
-        return _on_seg
-
-    RESPONSES = {
-        "en": {
-            "greet": ["hello", "hi ", "hey"],
-            "greet_r": "Hey {who}!",
-            "how": ["how are you", "how're you", "how do you do"],
-            "how_r": "I'm doing great, thanks for asking!",
-            "thanks": ["thank", "thanks"],
-            "thanks_r": "You're welcome!",
-            "bye": ["bye", "goodbye", "see you"],
-            "bye_r": "Goodbye {who}, see you later!",
-            "time": ["what time", "what's the time"],
-            "time_r": "It's {time}.",
-            "who": ["who am i", "what's my name", "do you know me"],
-            "who_known_r": "You're {who}, of course!",
-            "who_unknown_r": "I don't think we've met yet.",
-            "echo_r": "I heard you say: {text}",
-        },
-        "sv": {
-            "greet": ["hej", "hallå", "tjena"],
-            "greet_r": "Hej {who}!",
-            "how": ["hur mår du", "hur är det", "läget"],
-            "how_r": "Jag mår bra, tack för att du frågar!",
-            "thanks": ["tack"],
-            "thanks_r": "Varsågod!",
-            "bye": ["hejdå", "vi ses", "adjö"],
-            "bye_r": "Hejdå {who}, vi ses!",
-            "time": ["vad är klockan", "vilken tid"],
-            "time_r": "Klockan är {time}.",
-            "who": ["vem är jag", "vet du vem jag är"],
-            "who_known_r": "Du är {who}, såklart!",
-            "who_unknown_r": "Jag tror inte vi har träffats.",
-            "echo_r": "Jag hörde dig säga: {text}",
-        },
-        "de": {
-            "greet": ["hallo", "hi ", "hey", "guten tag"],
-            "greet_r": "Hallo {who}!",
-            "how": ["wie geht", "wie bist du"],
-            "how_r": "Mir geht es gut, danke der Nachfrage!",
-            "thanks": ["danke"],
-            "thanks_r": "Bitte schön!",
-            "bye": ["tschüss", "auf wiedersehen", "bis bald"],
-            "bye_r": "Tschüss {who}, bis später!",
-            "time": ["wie spät", "wieviel uhr"],
-            "time_r": "Es ist {time}.",
-            "who": ["wer bin ich", "kennst du mich"],
-            "who_known_r": "Du bist {who}, natürlich!",
-            "who_unknown_r": "Ich glaube nicht, dass wir uns kennen.",
-            "echo_r": "Ich habe gehört: {text}",
-        },
-    }
-
-    def get_response(text, person=None):
-        if not text:
-            return None
-        lang = voice.detected_language or "en"
-        templates = RESPONSES.get(lang, RESPONSES["en"])
-        lower = text.lower()
-        who = person or ("there" if lang == "en" else "")
-        time_str = datetime.now().strftime("%I:%M %p")
-
-        if any(w in lower for w in templates["how"]):
-            return templates["how_r"]
-        elif any(w in lower for w in templates["thanks"]):
-            return templates["thanks_r"]
-        elif any(w in lower for w in templates["greet"]):
-            return templates["greet_r"].format(who=who)
-        elif any(w in lower for w in templates["bye"]):
-            return templates["bye_r"].format(who=who)
-        elif any(w in lower for w in templates["time"]):
-            return templates["time_r"].format(time=time_str)
-        elif any(w in lower for w in templates["who"]):
-            if person:
-                return templates["who_known_r"].format(who=who)
-            else:
-                return templates["who_unknown_r"]
-        else:
-            return templates["echo_r"].format(text=text)
-
-    def handle_heard_speech(text):
-        nonlocal voice_busy, voice_status
-        if voice_busy or not text:
-            return
-        voice_busy = True
-        if continuous_listener:
-            continuous_listener.paused = True
-        primary = tracker.get_primary_face()
-        person = tracker.get_name(primary.track_id) if primary else None
-        lang = voice.detected_language or "?"
-        lang_prob = voice.detected_language_prob or 0
-        event_log.add("voice", f"Speech detected ({lang} {lang_prob:.0%})",
-                      f'speaker={person or "unknown"}, text="{text}"')
-        add_conversation("heard", f"[{lang} {lang_prob:.0%}] {text}")
-        voice_status = f'Heard [{lang}]: "{text}"'
-        response = get_response(text, person)
-        if response:
-            event_log.add("action", f"Responding to {person or 'unknown'}",
-                          f'"{response}"')
-            do_speak_and_show(response)
-        voice_status = ""
-        voice_busy = False
-        if continuous_listener and continuous_listen_enabled:
-            continuous_listener.paused = False
-
-    continuous_listener = None
-    if CONTINUOUS_LISTEN:
-        continuous_listener = ContinuousListener(voice, on_heard=handle_heard_speech)
-        continuous_listener.start()
-        print("[Continuous listening enabled - speak anytime]")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # --- Face tracking (replaces all inline detection/recognition/emotion) ---
-        faces = tracker.process_frame(frame)
-        visible_faces = [f for f in faces if f.is_visible]
-
-        # Ensure selected_track_id is valid
-        if selected_track_id is not None:
-            if not any(f.track_id == selected_track_id for f in visible_faces):
-                selected_track_id = visible_faces[0].track_id if visible_faces else None
-        elif visible_faces:
-            selected_track_id = visible_faces[0].track_id
-
-        # --- Greet known faces ---
-        if (voice.ready and tts.ready) and not voice_busy:
-            for face in visible_faces:
-                name = tracker.get_name(face.track_id)
-                if name:
-                    now = time.time()
-                    if name not in greeted_recently or (now - greeted_recently[name]) > GREETING_COOLDOWN:
-                        last_seen_ts = face_db.get_last_seen(name)
-                        if last_seen_ts:
-                            event_log.add("reasoning", f"Greeting {name}: last seen {now - last_seen_ts:.0f}s ago, emotion={face.emotion}")
-                        else:
-                            event_log.add("reasoning", f"Greeting {name}: first encounter, emotion={face.emotion}")
-                        greeted_recently[name] = now
-                        greeting = get_greeting(face_db, name, face.emotion)
-                        face_db.update_last_seen(name)
-                        face_db.save()
-                        voice_busy = True
-                        voice_status = f"Greeting {name}..."
-                        event_log.add("action", f"Speaking greeting to {name}", f'"{greeting}"')
-
-                        def _do_greet(text=greeting, person=name):
-                            nonlocal voice_busy, voice_status, is_listening
-                            if continuous_listener:
-                                continuous_listener.paused = True
-                            do_speak_and_show(text)
-                            if not continuous_listen_enabled:
-                                is_listening = True
-                                voice_status = "Listening..."
-                                event_log.add("voice", f"Listening for response from {person}")
-                                response = voice.listen(on_segment=make_on_segment())
-                                is_listening = False
-                                if response:
-                                    add_conversation("heard", response)
-                                    event_log.add("voice", f"Heard from {person}: {response}")
-                                    resp = get_response(response, person)
-                                    if resp:
-                                        event_log.add("action", f"Responding", f'"{resp}"')
-                                        do_speak_and_show(resp)
-                            voice_status = ""
-                            voice_busy = False
-                            if continuous_listener and continuous_listen_enabled:
-                                continuous_listener.paused = False
-
-                        threading.Thread(target=_do_greet, daemon=True).start()
+    try:
+        while True:
+            if frame_interval > 0:
+                now = time.time()
+                if now - last_frame < frame_interval:
+                    wait_ms = max(1, int((frame_interval - (now - last_frame)) * 1000))
+                    key = cv2.waitKey(wait_ms) & 0xFF
+                    if key == ord("q") or key == 27:
                         break
+                    continue
+                last_frame = now
 
-        # --- Auto-ask unknown faces (using stable track IDs) ---
-        if auto_ask and (voice.ready and tts.ready) and not voice_busy:
-            for face in visible_faces:
-                if not tracker.is_recognized(face.track_id):
-                    tid = face.track_id
-                    if face.frames_visible < 3:
-                        continue  # wait for 3 consecutive frames before asking
-                    now = time.time()
-                    if tid in asked_tracks and (now - asked_tracks[tid]) <= UNKNOWN_ASK_COOLDOWN:
-                        continue
-                    event_log.add("reasoning", f"Unknown face (track {tid}): auto-asking",
-                                  f"visible for {face.frames_visible} frames")
-                    asked_tracks[tid] = now
-                    voice_busy = True
-                    voice_status = "Asking..."
-                    selected_track_id = tid
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-                    def _do_voice_ask(track_id=tid, frm=frame.copy()):
-                        nonlocal voice_busy, voice_status, is_listening
-                        if continuous_listener:
-                            continuous_listener.paused = True
-                        event_log.add("action", "Asking unknown face for name")
-                        do_speak_and_show("Hello! I don't think we've met. What is your name?")
-                        is_listening = True
-                        voice_status = "Listening..."
-                        response = voice.listen(on_segment=make_on_segment())
-                        is_listening = False
-                        if response:
-                            add_conversation("heard", response)
-                            event_log.add("voice", f"Heard: {response}")
-                        extracted = extract_name(response)
-                        if extracted:
-                            event_log.add("face", f"Learned new face: {extracted}",
-                                          f"from speech: '{response}'")
-                            tracker.learn_face(track_id, extracted, frm)
-                            do_speak_and_show(f"Nice to meet you, {extracted}!")
-                            voice_status = f"Learned: {extracted}"
-                        else:
-                            event_log.add("voice", "Failed to extract name",
-                                          f"raw speech: '{response}'")
-                            do_speak_and_show("Sorry, I didn't catch that.")
-                            voice_status = "Didn't catch name"
-                        voice_busy = False
-                        if continuous_listener and continuous_listen_enabled:
-                            continuous_listener.paused = False
+            # --- Face tracking ---
+            tracker.process_frame(frame)
+            agent.check_unknown_faces(frame)
 
-                    threading.Thread(target=_do_voice_ask, daemon=True).start()
-                    break
+            # --- Draw ---
+            draw_faces(frame, tracker)
+            draw_audio_meter(frame, audio_monitor, voice_in)
+            draw_event_log_window(event_log)
 
-        # --- Draw face boxes ---
-        for face in visible_faces:
-            is_selected = (face.track_id == selected_track_id)
-            face_name = tracker.get_name(face.track_id)
-            face_conf = tracker.get_confidence(face.track_id)
-            color = (0, 255, 255) if is_selected else (0, 255, 0) if face_name else (0, 0, 255)
-            thickness = 3 if is_selected else 2
-            top, right, bottom, left = face.bbox
+            # Status bar
+            visible = tracker.get_visible_faces()
+            status = f"Faces: {len(visible)} | Known: {len(face_db.known_names)} | People: {memory.active_count}"
+            if agent.busy:
+                status += " | BUSY"
+            if agent.auto_ask:
+                status += " | AUTO-ASK"
+            cv2.putText(frame, status, (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-            cv2.rectangle(frame, (left, top), (right, bottom), color, thickness)
-            if face_name:
-                label = f"{face_name} {face_conf:.0f}%"
-            else:
-                label = f"Unknown #{face.track_id}"
-            if is_selected:
-                label += " [sel]"
-            cv2.rectangle(frame, (left, bottom), (right, bottom + 30), color, cv2.FILLED)
-            cv2.putText(frame, label, (left + 6, bottom + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-            if face.emotion:
-                cv2.putText(frame, face.emotion, (left, top - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            keys_hint = "L=learn T=talk C=continuous A=auto-ask D=delete Q=quit"
+            cv2.putText(frame, keys_hint, (10, frame.shape[0] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
-        # --- Draw overlays ---
-        draw_audio_meter(frame, audio_monitor, voice)
-        draw_listening_indicator(frame, is_listening, voice_status)
-        draw_conversation(frame, conversation_lines)
-        draw_event_log_window(event_log)
+            cv2.imshow("Face Recognition", frame)
 
-        # --- Status bar ---
-        voice_tag = " | Voice: loading..." if not (voice.ready and tts.ready) else ""
-        auto_tag = " | AUTO-ASK" if auto_ask else ""
-        if continuous_listen_enabled:
-            auto_tag += " | ALWAYS-ON"
-        if voice_status and (voice.ready and tts.ready):
-            voice_tag = f" | {voice_status}"
-        status = f"Known: {len(face_db.known_names)} people | Faces: {len(visible_faces)}{auto_tag}{voice_tag}"
-        cv2.putText(frame, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            # --- Keyboard controls ---
+            key = cv2.waitKey(1) & 0xFF
 
-        keys_hint = "L=learn V=voice-ask T=talk C=continuous A=auto-ask TAB=select D=delete Q=quit"
-        h = frame.shape[0]
-        cv2.putText(frame, keys_hint, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+            if key == ord("q") or key == 27:
+                break
 
-        cv2.imshow("Face Recognition", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("q") or key == 27:
-            break
-        elif key == 9:  # TAB - cycle through visible faces by stable ID
-            if visible_faces:
-                ids = [f.track_id for f in visible_faces]
-                if selected_track_id in ids:
-                    idx = (ids.index(selected_track_id) + 1) % len(ids)
-                    selected_track_id = ids[idx]
-                else:
-                    selected_track_id = ids[0]
-        elif key == ord("c"):
-            continuous_listen_enabled = not continuous_listen_enabled
-            if continuous_listener:
-                continuous_listener.paused = not continuous_listen_enabled
-            elif continuous_listen_enabled:
-                continuous_listener = ContinuousListener(voice, on_heard=handle_heard_speech)
-                continuous_listener.start()
-            voice_status = "Continuous listen " + ("enabled" if continuous_listen_enabled else "disabled")
-            event_log.add("action", f"Continuous listen: {'ON' if continuous_listen_enabled else 'OFF'}")
-        elif key == ord("a"):
-            auto_ask = not auto_ask
-            voice_status = "Auto-ask " + ("enabled" if auto_ask else "disabled")
-            event_log.add("action", f"Auto-ask: {'ON' if auto_ask else 'OFF'}")
-        elif key == ord("t"):
-            if (voice.ready and tts.ready) and not voice_busy:
-                voice_busy = True
+            elif key == ord("l"):
+                # Learn: label a face via keyboard
                 primary = tracker.get_primary_face()
-                talk_name = tracker.get_name(primary.track_id) if primary else None
-
-                def _do_talk(person=talk_name):
-                    nonlocal voice_busy, voice_status, is_listening
-                    if continuous_listener:
-                        continuous_listener.paused = True
-                    event_log.add("voice", f"Talk mode: listening", f"talking_to={person or 'unknown'}")
-                    is_listening = True
-                    voice_status = "Listening..."
-                    response = voice.listen(on_segment=make_on_segment())
-                    is_listening = False
-                    if response:
-                        add_conversation("heard", response)
-                        event_log.add("voice", f"Heard: {response}")
-                        resp = get_response(response, person)
-                        if resp:
-                            event_log.add("action", f"Responding", f'"{resp}"')
-                            do_speak_and_show(resp)
-                        voice_status = ""
-                    else:
-                        event_log.add("voice", "No speech detected in talk mode")
-                        voice_status = "Didn't hear anything"
-                    voice_busy = False
-                    if continuous_listener and continuous_listen_enabled:
-                        continuous_listener.paused = False
-
-                threading.Thread(target=_do_talk, daemon=True).start()
-        elif key == ord("v"):
-            if selected_track_id and (voice.ready and tts.ready) and not voice_busy:
-                voice_busy = True
-                voice_status = "Asking..."
-                frm = frame.copy()
-                ask_tid = selected_track_id
-
-                def _do_manual_voice(track_id=ask_tid, frm=frm):
-                    nonlocal voice_busy, voice_status, is_listening
-                    if continuous_listener:
-                        continuous_listener.paused = True
-                    do_speak_and_show("Hello! What is your name?")
-                    is_listening = True
-                    voice_status = "Listening..."
-                    response = voice.listen(on_segment=make_on_segment())
-                    is_listening = False
-                    if response:
-                        add_conversation("heard", response)
-                    extracted = extract_name(response)
-                    if extracted:
-                        tracker.learn_face(track_id, extracted, frm)
-                        do_speak_and_show(f"Nice to meet you, {extracted}!")
-                        voice_status = f"Learned: {extracted}"
-                    else:
-                        do_speak_and_show("Sorry, I didn't catch that.")
-                        voice_status = "Didn't catch name"
-                    voice_busy = False
-                    if continuous_listener and continuous_listen_enabled:
-                        continuous_listener.paused = False
-
-                threading.Thread(target=_do_manual_voice, daemon=True).start()
-        elif key == ord("l"):
-            if selected_track_id:
-                face = tracker.get_face_by_id(selected_track_id)
-                if face:
-                    existing_match = None
-                    if tracker.is_recognized(face.track_id):
-                        existing_match = (tracker.get_name(face.track_id), tracker.get_confidence(face.track_id))
-                    name = get_name_from_gui(frame, existing_match)
+                if primary:
+                    existing = None
+                    if tracker.is_recognized(primary.track_id):
+                        existing = (tracker.get_name(primary.track_id),
+                                    tracker.get_confidence(primary.track_id))
+                    name = get_name_from_gui(frame, existing)
                     if name:
-                        tracker.learn_face(selected_track_id, name, frame)
+                        tracker.learn_face(primary.track_id, name, frame)
                         event_log.add("face", f"Manually learned: {name}")
-        elif key == ord("d"):
-            show_overlay(frame, [
-                ("Delete all known faces? Y/N", (0, 0, 255), 0.8),
-            ])
-            confirm = cv2.waitKey(0) & 0xFF
-            if confirm == ord("y"):
-                event_log.add("action", "Database cleared", f"was {len(face_db.known_names)} people")
-                face_db.clear()
-                voice_status = "Database cleared"
 
+            elif key == ord("t"):
+                # Talk: manual one-shot listen + respond
+                if not agent.busy:
+                    primary = tracker.get_primary_face()
+                    tid = primary.track_id if primary else None
+                    def _do_talk(track_id=tid):
+                        agent.pause_listening()
+                        response = voice_in.listen()
+                        if response:
+                            lang = voice_in.detected_language or "en"
+                            if track_id:
+                                memory.add_dialogue(track_id, "person", response, language=lang)
+                            reply = llm.generate_response(memory, track_id, response, language=lang)
+                            if track_id:
+                                memory.add_dialogue(track_id, "system", reply, language=lang)
+                            agent.speak(reply)
+                        agent.resume_listening()
+                    threading.Thread(target=_do_talk, daemon=True).start()
+
+            elif key == ord("c"):
+                # Toggle continuous listening
+                if agent._listener:
+                    agent._listener.paused = not agent._listener.paused
+                    state = "OFF" if agent._listener.paused else "ON"
+                    event_log.add("action", f"Continuous listen: {state}")
+
+            elif key == ord("a"):
+                agent.auto_ask = not agent.auto_ask
+                event_log.add("action", f"Auto-ask: {'ON' if agent.auto_ask else 'OFF'}")
+
+            elif key == ord("d"):
+                show_overlay(frame, [
+                    ("Delete all known faces? Y/N", (0, 0, 255), 0.8),
+                ])
+                confirm = cv2.waitKey(0) & 0xFF
+                if confirm == ord("y"):
+                    event_log.add("action", "Database cleared",
+                                  f"was {len(face_db.known_names)} people")
+                    face_db.clear()
+
+    except KeyboardInterrupt:
+        pass
+
+    # --- Shutdown ---
     event_log.add("system", "App shutting down")
-    if continuous_listener:
-        continuous_listener.stop()
+    agent.stop()
     audio_monitor.stop()
     cap.release()
     cv2.destroyAllWindows()
     logger.info(f"Session log saved to {LOG_FILE}")
-    print(f"Log saved to {LOG_FILE}")
+    print(f"\nLog saved to {LOG_FILE}")
     print("Goodbye!")
 
 

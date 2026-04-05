@@ -12,17 +12,22 @@ Option A: Config file (mcp_servers.json)
         "servers": [
             {
                 "name": "lights",
+                "description": "Control smart home lights (on/off, brightness, color)",
                 "type": "sse",
                 "url": "http://localhost:8000/sse"
             },
             {
                 "name": "search",
+                "description": "Search the web for information",
                 "type": "stdio",
                 "command": "uv",
                 "args": ["--directory", "../my_mcp", "run", "server.py"]
             }
         ]
     }
+
+The "description" field is shown to the LLM so it can explain its own
+capabilities in conversation (e.g. "I can control your lights").
 
 Option B: CLI flag
 
@@ -48,13 +53,15 @@ DEFAULT_CONFIG = "mcp_servers.json"
 def load_servers(
     config_path: Optional[str] = None,
     server_urls: Optional[list[str]] = None,
-) -> list:
+) -> tuple[list, list[str]]:
     """Load MCP servers from a config file and/or CLI URLs.
 
-    Returns a list of pydantic-ai toolset objects, ready to pass
-    to ``Agent(toolsets=[...])``.
+    Returns:
+        (servers, descriptions) — servers are pydantic-ai toolset objects,
+        descriptions are human-readable strings for the system prompt.
     """
     servers = []
+    descriptions = []
 
     # --- Config file ---
     path = Path(config_path or DEFAULT_CONFIG)
@@ -65,6 +72,8 @@ def load_servers(
             server = _create_server(entry)
             if server:
                 servers.append(server)
+                desc = entry.get("description", entry.get("name", "unnamed tool"))
+                descriptions.append(desc)
         logger.info(f"Loaded {len(servers)} MCP server(s) from {path}")
     elif config_path:
         logger.warning(f"MCP config not found: {path}")
@@ -73,10 +82,11 @@ def load_servers(
     for url in server_urls or []:
         logger.info(f"MCP server (CLI): SSE -> {url}")
         servers.append(MCPServerSSE(url=url))
+        descriptions.append(f"Tools at {url}")
 
     if servers:
         logger.info(f"Total MCP servers: {len(servers)}")
-    return servers
+    return servers, descriptions
 
 
 def _create_server(entry: dict):

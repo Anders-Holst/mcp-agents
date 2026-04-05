@@ -168,49 +168,7 @@ class VoiceEvent:
 VoiceEventCallback = Callable[[VoiceEvent], None]
 
 
-# ---------------------------------------------------------------------------
-# Event dispatcher (same pattern as face_tracker.py)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _Subscription:
-    callback: VoiceEventCallback
-    event_types: Optional[set]
-
-
-class _EventDispatcher:
-    def __init__(self):
-        self._subs: list[_Subscription] = []
-        self._lock = threading.Lock()
-
-    def subscribe(self, callback, event_types=None):
-        sub = _Subscription(callback=callback, event_types=event_types)
-        with self._lock:
-            self._subs.append(sub)
-
-        def _unsub():
-            with self._lock:
-                try:
-                    self._subs.remove(sub)
-                except ValueError:
-                    pass
-        return _unsub
-
-    def unsubscribe(self, callback):
-        with self._lock:
-            before = len(self._subs)
-            self._subs = [s for s in self._subs if s.callback is not callback]
-            return len(self._subs) < before
-
-    def dispatch(self, event):
-        with self._lock:
-            subs = list(self._subs)
-        for sub in subs:
-            if sub.event_types is None or event.type in sub.event_types:
-                try:
-                    sub.callback(event)
-                except Exception:
-                    logger.exception(f"Exception in voice event callback for {event.type.name}")
+from events import EventDispatcher
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +258,7 @@ class VoiceInput:
         self.detected_language: str = ""
         self.detected_language_prob: float = 0.0
 
-        self._dispatcher = _EventDispatcher()
+        self._dispatcher = EventDispatcher(owner="voice_input")
 
     # --- Event API ---
 

@@ -11,7 +11,6 @@ Can be run standalone with face_tracker + voice_input + voice_output:
 """
 
 import time
-import asyncio
 import threading
 import logging
 import argparse
@@ -20,21 +19,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Callable, Union
 
-from pydantic_ai import Agent as PydanticAgent
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
-
 from face_tracker import (
     FaceTracker, FaceDatabase, EmotionDetector, FaceEvent, FaceEventType,
-    FaceAppearedPayload, FaceDisappearedPayload, IdentityConfirmedPayload,
-    FocusChangedPayload,
 )
-from voice_input import (
-    VoiceInput, AudioMonitor, ContinuousListener,
-    VoiceEvent, VoiceEventType, TranscriptionCompletePayload,
-)
-from voice_output import VoiceOutput, TtsEventType
+from voice_input import VoiceInput, AudioMonitor, ContinuousListener
+from voice_output import VoiceOutput
 from people_memory import PeopleMemory
+from llm import ConversationLLM
 
 logger = logging.getLogger("agent")
 
@@ -117,43 +108,7 @@ class AgentEvent:
 AgentEventCallback = Callable[[AgentEvent], None]
 
 
-# ---------------------------------------------------------------------------
-# Event dispatcher
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _Subscription:
-    callback: AgentEventCallback
-    event_types: Optional[set]
-
-
-class _EventDispatcher:
-    def __init__(self):
-        self._subs: list[_Subscription] = []
-        self._lock = threading.Lock()
-
-    def subscribe(self, callback, event_types=None):
-        sub = _Subscription(callback=callback, event_types=event_types)
-        with self._lock:
-            self._subs.append(sub)
-
-        def _unsub():
-            with self._lock:
-                try:
-                    self._subs.remove(sub)
-                except ValueError:
-                    pass
-        return _unsub
-
-    def dispatch(self, event):
-        with self._lock:
-            subs = list(self._subs)
-        for sub in subs:
-            if sub.event_types is None or event.type in sub.event_types:
-                try:
-                    sub.callback(event)
-                except Exception:
-                    logger.exception(f"Exception in agent event callback for {event.type.name}")
+from events import EventDispatcher
 
 
 # ---------------------------------------------------------------------------
@@ -177,118 +132,6 @@ def extract_name(text: str) -> Optional[str]:
     if name:
         name = name.strip(".,!?").capitalize()
     return name if name and len(name) > 1 else None
-
-
-SYSTEM_PROMPT = """You are a friendly assistant with a camera and microphone. You speak aloud.
-Rules: Reply in 1-2 short sentences. Match their language. No markdown or emojis. Time: {time}"""
-
-
-class ConversationLLM:
-    """LLM-powered conversation engine using pydantic-ai + Ollama.
-
-    Supports MCP toolsets so the LLM can call external tools (smart home,
-    search, etc.).  Pass MCP servers via the ``mcp_servers`` parameter —
-    see ``mcp_client.py`` for how to configure them.
-    """
-
-    def __init__(self, model_name: str = "qwen3:8b",
-                 ollama_url: str = "http://localhost:11434/v1",
-                 mcp_servers: Optional[list] = None):
-        provider = OpenAIProvider(base_url=ollama_url, api_key="ollama")
-        model = OpenAIChatModel(model_name, provider=provider)
-        self._model = model
-        self._model_name = model_name
-        self._mcp_servers = mcp_servers or []
-
-        # Background event loop for async MCP operations
-        self._loop = asyncio.new_event_loop()
-        self._loop_thread = threading.Thread(
-            target=self._loop.run_forever, daemon=True, name="llm-loop")
-        self._loop_thread.start()
-
-        if self._mcp_servers:
-            logger.info(f"ConversationLLM: {len(self._mcp_servers)} MCP toolset(s) active")
-
-    def stop(self):
-        """Shut down the background event loop."""
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._loop_thread.join(timeout=5)
-
-    def _make_agent(self) -> PydanticAgent:
-        """Create a pydantic-ai agent with current system prompt + MCP toolsets."""
-        system = SYSTEM_PROMPT.format(time=datetime.now().strftime("%H:%M"))
-        return PydanticAgent(
-            self._model,
-            system_prompt=system,
-            toolsets=self._mcp_servers,
-        )
-
-    # --- Core LLM call (sync wrapper around async) ---
-
-    def _call_llm(self, prompt: str, label: str, fallback: str) -> str:
-        """Call the LLM (with MCP tools if configured). Thread-safe."""
-        logger.info(f"[LLM:{label}] model={self._model_name}")
-        logger.info(f"[LLM:{label}] prompt:\n{prompt}")
-        start = time.time()
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._arun(prompt), self._loop)
-            output = future.result(timeout=60)
-            elapsed = time.time() - start
-            logger.info(f"[LLM:{label}] response ({elapsed:.1f}s): {output}")
-            return output
-        except Exception as e:
-            elapsed = time.time() - start
-            logger.warning(f"[LLM:{label}] FAILED after {elapsed:.1f}s: {e}")
-            logger.info(f"[LLM:{label}] using fallback: {fallback}")
-            return fallback
-
-    async def _arun(self, prompt: str) -> str:
-        """Run a single LLM query, connecting MCP servers if needed."""
-        agent = self._make_agent()
-        if self._mcp_servers:
-            async with agent:
-                result = await agent.run(prompt)
-                return result.output.strip()
-        else:
-            result = await agent.run(prompt)
-            return result.output.strip()
-
-    # --- High-level generation methods ---
-
-    def generate_greeting(self, memory: PeopleMemory, track_id: int,
-                          emotion: str = "") -> str:
-        """Generate a contextual greeting using the LLM."""
-        context = memory.get_context_for_llm(track_id, max_dialogues=5)
-        person = memory.get(track_id)
-        name = person.name if person else "someone"
-
-        prompt = f"""Greet this person. One sentence.
-{context}
-Emotion: {emotion or 'neutral'}"""
-
-        fallback = f"Hello, {name}!" if name != "someone" else "Hello there!"
-        return self._call_llm(prompt, "greeting", fallback)
-
-    def generate_response(self, memory: PeopleMemory, track_id: Optional[int],
-                          heard_text: str, language: str = "en") -> str:
-        """Generate a response to speech using the LLM."""
-        if track_id:
-            context = memory.get_context_for_llm(track_id, max_dialogues=5)
-        else:
-            context = "Unknown person."
-
-        prompt = f"""They said: "{heard_text}" (language: {language})
-{context}
-Reply in their language. One sentence."""
-
-        return self._call_llm(prompt, "response", f"I heard you say: {heard_text}")
-
-    def generate_ask_name(self, track_id: int) -> str:
-        """Generate a natural way to ask someone's name."""
-        prompt = "An unknown person just appeared on camera. Ask them for their name in a friendly way. One short sentence."
-        return self._call_llm(prompt, "ask_name",
-                              "Hello! I don't think we've met. What is your name?")
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +179,7 @@ class Agent:
         self._listener: Optional[ContinuousListener] = None
 
         # Event system
-        self._dispatcher = _EventDispatcher()
+        self._dispatcher = EventDispatcher(owner="agent")
 
         # Subscribe to face events
         self.tracker.subscribe(self._on_face_event)
@@ -416,57 +259,35 @@ class Agent:
             self._handle_face_appeared(event)
 
     def _handle_identity_confirmed(self, event: FaceEvent):
-        """A face was just identified — greet if appropriate."""
-        if not self.auto_greet:
-            return
+        """A face was just identified — update memory and greet."""
         p = event.payload
-        name = p.name
         tid = event.track_id
-
-        # Update memory
         face = self.tracker.get_face_by_id(tid)
-        emotion = face.emotion if face else ""
-        self.memory.identify(tid, name)
-        self.memory.update_seen(tid, emotion)
-
-        # Check cooldown
-        now = time.time()
-        if name in self._greeted and (now - self._greeted[name]) < self._greeting_cooldown:
-            return
-
-        self._greeted[name] = now
-        threading.Thread(target=self._do_greet, args=(tid,), daemon=True).start()
+        self.memory.identify(tid, p.name)
+        self.memory.update_seen(tid, face.emotion if face else "")
+        self._try_greet(tid, p.name)
 
     def _handle_face_appeared(self, event: FaceEvent):
-        """A new face appeared — greet if known, track if unknown."""
+        """A new face appeared — track in memory, greet if known."""
         p = event.payload
         tid = event.track_id
         logger.info(f"[AGENT] FACE_APPEARED: track={tid} name={p.initial_name} emotion={p.emotion}")
-
-        # Create memory entry
         self.memory.get_or_create(tid)
         if p.initial_name:
             self.memory.identify(tid, p.initial_name)
             self.memory.update_seen(tid, p.emotion)
+            self._try_greet(tid, p.initial_name)
 
-            # Greet immediately if auto_greet and not on cooldown
-            if not self.auto_greet:
-                logger.info(f"[AGENT] auto_greet disabled, skipping")
-                return
-            if self._busy:
-                logger.info(f"[AGENT] busy, skipping greet for {p.initial_name}")
-                return
-
-            now = time.time()
-            name = p.initial_name
-            if name in self._greeted and (now - self._greeted[name]) < self._greeting_cooldown:
-                elapsed = now - self._greeted[name]
-                logger.info(f"[AGENT] greet cooldown for {name}: {elapsed:.0f}s / {self._greeting_cooldown:.0f}s")
-                return
-
-            logger.info(f"[AGENT] triggering greet for {name} (track {tid})")
-            self._greeted[name] = now
-            threading.Thread(target=self._do_greet, args=(tid,), daemon=True).start()
+    def _try_greet(self, track_id: int, name: str):
+        """Greet a person if auto_greet is on, agent is free, and cooldown expired."""
+        if not self.auto_greet or self._busy or not name:
+            return
+        now = time.time()
+        if name in self._greeted and (now - self._greeted[name]) < self._greeting_cooldown:
+            return
+        logger.info(f"[AGENT] triggering greet for {name} (track {track_id})")
+        self._greeted[name] = now
+        threading.Thread(target=self._do_greet, args=(track_id,), daemon=True).start()
 
     def _handle_face_disappeared(self, event: FaceEvent):
         """A face left the frame — say goodbye if it was a known person."""
@@ -665,6 +486,8 @@ def main():
                         help="Path to MCP servers JSON config (default: mcp_servers.json)")
     parser.add_argument("--mcp-server", action="append", default=[],
                         help="MCP server SSE URL (can be repeated)")
+    parser.add_argument("--agent-name", default="Face Agent",
+                        help="Name the agent uses to describe itself")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -687,12 +510,15 @@ def main():
     memory.load()
 
     from mcp_client import load_servers
-    mcp_servers = load_servers(config_path=args.mcp_config, server_urls=args.mcp_server)
+    mcp_servers, mcp_descriptions = load_servers(
+        config_path=args.mcp_config, server_urls=args.mcp_server)
 
     llm = ConversationLLM(
         model_name=args.llm_model,
         ollama_url=args.ollama_url,
         mcp_servers=mcp_servers,
+        mcp_descriptions=mcp_descriptions,
+        agent_name=args.agent_name,
     )
     logger.info(f"LLM: {args.llm_model} via {args.ollama_url}")
 

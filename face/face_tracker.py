@@ -145,50 +145,7 @@ class FaceEvent:
 FaceEventCallback = Callable[[FaceEvent], None]
 
 
-# ---------------------------------------------------------------------------
-# Event dispatcher
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _Subscription:
-    callback: FaceEventCallback
-    event_types: Optional[set]  # None = all
-
-
-class _EventDispatcher:
-    def __init__(self):
-        self._subs: list[_Subscription] = []
-        self._lock = threading.Lock()
-
-    def subscribe(self, callback: FaceEventCallback,
-                  event_types: Optional[set] = None) -> Callable[[], None]:
-        sub = _Subscription(callback=callback, event_types=event_types)
-        with self._lock:
-            self._subs.append(sub)
-
-        def _unsub():
-            with self._lock:
-                try:
-                    self._subs.remove(sub)
-                except ValueError:
-                    pass
-        return _unsub
-
-    def unsubscribe(self, callback: FaceEventCallback) -> bool:
-        with self._lock:
-            before = len(self._subs)
-            self._subs = [s for s in self._subs if s.callback is not callback]
-            return len(self._subs) < before
-
-    def dispatch(self, event: FaceEvent):
-        with self._lock:
-            subs = list(self._subs)
-        for sub in subs:
-            if sub.event_types is None or event.type in sub.event_types:
-                try:
-                    sub.callback(event)
-                except Exception:
-                    logger.exception(f"Exception in event callback for {event.type.name}")
+from events import EventDispatcher
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +363,7 @@ class FaceTracker:
         self._emotion_stable: dict[int, tuple[str, float]] = {}
 
         # Event system
-        self._dispatcher = _EventDispatcher()
+        self._dispatcher = EventDispatcher(owner="face_tracker")
 
         # Legacy bridge for on_event callback
         if on_event:
