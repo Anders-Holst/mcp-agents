@@ -30,7 +30,7 @@ can give it extra capabilities like controlling smart home devices.
  |   [decide]           [respond]      |
  |       |                  |          |
  |       v                  v          |
- |  ConversationLLM  (Ollama + MCP)    |
+ |     llm  (Ollama + MCP tools)       |
  |       |                             |
  |       v                             |
  |  voice_output  (piper TTS)          |
@@ -43,6 +43,8 @@ can give it extra capabilities like controlling smart home devices.
  | dialogues,   |     | config/loader  |
  | facts, prefs |     +----------------+
  +--------------+
+
+All modules use events.py for publish/subscribe communication.
 ```
 
 ## Agent decision logic
@@ -89,13 +91,15 @@ it's a quick speak with no LLM call.
 
 | File | Purpose | Run standalone |
 |------|---------|----------------|
+| `agent.py` | Decision logic: what to do when a face/voice event arrives | `pixi run agent` |
+| `llm.py` | System prompt, LLM calls, MCP toolset wiring | -- |
 | `face_tracker.py` | Detection, recognition, emotion, tracking, events | `pixi run vision` |
 | `voice_input.py` | Mic monitoring, VAD, Whisper transcription | `pixi run listen` |
 | `voice_output.py` | Piper TTS, speak text aloud | `pixi run speak` |
 | `people_memory.py` | Per-person storage (dialogues, facts, prefs) | `pixi run people` |
 | `mcp_client.py` | Load MCP server configs for the LLM | -- |
-| `agent.py` | Decision loop tying it all together | `pixi run agent` |
-| `main.py` | Legacy all-in-one UI (pre-agent refactor) | `pixi run run` |
+| `events.py` | Shared EventDispatcher (pub/sub used by all modules) | -- |
+| `main.py` | UI shell: camera display, overlays, keyboard controls | `pixi run run` |
 
 ## Quick start
 
@@ -123,11 +127,13 @@ Create `mcp_servers.json`:
     "servers": [
         {
             "name": "lights",
+            "description": "Control smart home lights (on/off, brightness, color)",
             "type": "sse",
             "url": "http://localhost:8000/sse"
         },
         {
             "name": "dirigera",
+            "description": "Control IKEA smart home devices",
             "type": "stdio",
             "command": "uv",
             "args": ["--directory", "../dirigera/fastmcp", "run", "dirigeramcp.py"]
@@ -136,7 +142,8 @@ Create `mcp_servers.json`:
 }
 ```
 
-The agent picks up `mcp_servers.json` automatically.
+The agent picks up `mcp_servers.json` automatically. The `description` field
+is shown to the LLM so it can explain its own capabilities when asked.
 
 ### Option B: CLI flags
 
@@ -158,6 +165,7 @@ pixi run agent --mcp-config path/to/config.json
 --fps N              Target frame rate (default: 15)
 --llm-model NAME     Ollama model (default: qwen3:8b)
 --ollama-url URL     Ollama API URL (default: http://localhost:11434/v1)
+--agent-name NAME    Name the agent uses to describe itself (default: Face Agent)
 --mcp-config PATH    MCP servers JSON config file
 --mcp-server URL     MCP server SSE URL (repeatable)
 --no-auto-greet      Don't auto-greet known faces

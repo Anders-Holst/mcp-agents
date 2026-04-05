@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Callable, Union
 
+from events import EventDispatcher
 from face_tracker import (
     FaceTracker, FaceDatabase, EmotionDetector, FaceEvent, FaceEventType,
 )
@@ -106,9 +107,6 @@ class AgentEvent:
 
 
 AgentEventCallback = Callable[[AgentEvent], None]
-
-
-from events import EventDispatcher
 
 
 # ---------------------------------------------------------------------------
@@ -602,51 +600,8 @@ def main():
             agent.check_unknown_faces(frame)
 
             # Draw faces
-            focus_id = tracker.focus_track_id
-            for rank, face in enumerate(visible):
-                is_focus = (face.track_id == focus_id)
-                name = tracker.get_name(face.track_id)
-                conf = tracker.get_confidence(face.track_id)
-                top, right, bottom, left = face.bbox
-                color = (0, 255, 100) if is_focus else (0, 200, 0) if name else (0, 0, 200)
-                thickness = 4 if is_focus else 2
-
-                cv2.rectangle(frame, (left, top), (right, bottom), color, thickness)
-                label = f"[{rank+1}] {name or '?'} #{face.track_id}"
-                if conf:
-                    label += f" {conf:.0f}%"
-                cv2.rectangle(frame, (left, bottom), (right, bottom + 28), color, cv2.FILLED)
-                cv2.putText(frame, label, (left + 4, bottom + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2)
-                if face.emotion and face.emotion != "neutral":
-                    cv2.putText(frame, face.emotion, (left, top - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-                if is_focus:
-                    cv2.putText(frame, "FOCUS", (left, top - 26),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 100), 2)
-
-            # Draw occluded faces (dashed box at last known position)
-            occluded = [f for f in faces if not f.is_visible]
-            for face in occluded:
-                name = tracker.get_name(face.track_id)
-                top, right, bottom, left = face.bbox
-                color = (0, 200, 0) if name else (0, 0, 200)
-                dash_len = 10
-                # Top edge
-                for x in range(left, right, dash_len * 2):
-                    cv2.line(frame, (x, top), (min(x + dash_len, right), top), color, 1)
-                # Bottom edge
-                for x in range(left, right, dash_len * 2):
-                    cv2.line(frame, (x, bottom), (min(x + dash_len, right), bottom), color, 1)
-                # Left edge
-                for y in range(top, bottom, dash_len * 2):
-                    cv2.line(frame, (left, y), (left, min(y + dash_len, bottom)), color, 1)
-                # Right edge
-                for y in range(top, bottom, dash_len * 2):
-                    cv2.line(frame, (right, y), (right, min(y + dash_len, bottom)), color, 1)
-                label = f"{name or '?'} #{face.track_id} OCCLUDED"
-                cv2.putText(frame, label, (left, top - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+            from main import draw_faces
+            draw_faces(frame, tracker)
 
             status = f"Faces: {len(visible)} | Known: {len(face_db.known_names)} | People: {memory.active_count}"
             if agent.busy:

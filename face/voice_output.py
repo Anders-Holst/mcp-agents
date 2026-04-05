@@ -24,6 +24,8 @@ from typing import Optional, Callable, Union
 import sounddevice as sd
 from piper import PiperVoice
 
+from events import EventDispatcher
+
 logger = logging.getLogger("voice_output")
 
 PIPER_MODEL_DIR = "piper_models"
@@ -102,9 +104,6 @@ class TtsEvent:
 
 
 TtsEventCallback = Callable[[TtsEvent], None]
-
-
-from events import EventDispatcher
 
 
 # ---------------------------------------------------------------------------

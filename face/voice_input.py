@@ -21,12 +21,14 @@ import logging
 import argparse
 import collections
 from enum import Enum, auto
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Callable, Union
 
 import sounddevice as sd
 from faster_whisper import WhisperModel
+
+from events import EventDispatcher
 
 logger = logging.getLogger("voice_input")
 
@@ -166,9 +168,6 @@ class VoiceEvent:
 
 
 VoiceEventCallback = Callable[[VoiceEvent], None]
-
-
-from events import EventDispatcher
 
 
 # ---------------------------------------------------------------------------

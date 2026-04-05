@@ -31,6 +31,8 @@ from typing import Optional, Callable, Union
 
 import onnxruntime as ort
 
+from events import EventDispatcher
+
 logger = logging.getLogger("face_tracker")
 
 EMOTION_MODEL_DIR = "emotion_model"
@@ -143,9 +145,6 @@ class FaceEvent:
 
 
 FaceEventCallback = Callable[[FaceEvent], None]
-
-
-from events import EventDispatcher
 
 
 # ---------------------------------------------------------------------------
@@ -334,8 +333,7 @@ class FaceTracker:
                  recognition_revoke_seconds: float = 0.25,
                  focus_switch_threshold: float = 0.1,
                  focus_switch_seconds: float = 0.5,
-                 emotion_debounce_seconds: float = 0.3,
-                 on_event: Optional[Callable] = None):
+                 emotion_debounce_seconds: float = 0.3):
         self.db = db
         self.emotion_detector = emotion_detector
         self.frame_scale = frame_scale
@@ -364,56 +362,6 @@ class FaceTracker:
 
         # Event system
         self._dispatcher = EventDispatcher(owner="face_tracker")
-
-        # Legacy bridge for on_event callback
-        if on_event:
-            self._legacy_on_event = on_event
-            self._dispatcher.subscribe(self._legacy_bridge)
-
-    def _legacy_bridge(self, event: FaceEvent):
-        """Convert typed events to legacy (category, message, detail) format."""
-        cat = "face"
-        msg = ""
-        detail = None
-        p = event.payload
-        t = event.type
-
-        if t == FaceEventType.FACE_APPEARED:
-            if p.initial_name:
-                msg = f"Recognized: {p.initial_name} ({p.initial_confidence:.0f}%)"
-                detail = f"track={event.track_id}, emotion={p.emotion}"
-            else:
-                msg = f"New unknown face (track {event.track_id})"
-                detail = f"emotion={p.emotion}"
-        elif t == FaceEventType.FACE_DISAPPEARED:
-            if p.name:
-                msg = f"{p.name} left ({p.duration_visible:.1f}s visible)"
-            else:
-                msg = f"Unknown face left (track {event.track_id}, {p.duration_visible:.1f}s)"
-        elif t == FaceEventType.FACE_OCCLUDED:
-            name = p.name or f"track {event.track_id}"
-            msg = f"{name} occluded"
-        elif t == FaceEventType.FACE_RECOVERED:
-            name = p.name or f"track {event.track_id}"
-            msg = f"{name} recovered after {p.seconds_missing:.1f}s"
-        elif t == FaceEventType.IDENTITY_CONFIRMED:
-            msg = f"Identified: track {event.track_id} -> {p.name}"
-            detail = f"confidence={p.confidence:.0f}%"
-        elif t == FaceEventType.IDENTITY_LOST:
-            msg = f"Lost identity: {p.previous_name} (track {event.track_id})"
-        elif t == FaceEventType.IDENTITY_CHANGED:
-            msg = f"Re-identified: {p.old_name} -> {p.new_name} (track {event.track_id})"
-        elif t == FaceEventType.FACE_LEARNED:
-            msg = f"Learned: {p.name} (track {event.track_id})"
-        elif t == FaceEventType.FOCUS_CHANGED:
-            msg = f"Focus: track {p.old_track_id} -> {p.new_track_id}"
-            detail = f"score {p.old_focus_score:.2f} -> {p.new_focus_score:.2f}"
-        elif t == FaceEventType.EMOTION_CHANGED:
-            name = p.name or f"track {event.track_id}"
-            msg = f"{name}: {p.old_emotion} -> {p.new_emotion}"
-
-        if msg:
-            self._legacy_on_event(cat, msg, detail)
 
     # --- Public API ---
 
