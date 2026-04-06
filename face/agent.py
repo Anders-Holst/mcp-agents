@@ -367,6 +367,11 @@ class Agent:
                 self.memory.add_dialogue(tid, "system", response, language=lang)
             self.speak(response)
 
+            # Extract facts in background (don't block conversation)
+            if tid:
+                threading.Thread(target=self._extract_facts,
+                                 args=(tid, text), daemon=True).start()
+
         finally:
             self._busy = False
             self.resume_listening()
@@ -457,6 +462,15 @@ class Agent:
         finally:
             self._busy = False
             self.resume_listening()
+
+    def _extract_facts(self, track_id: int, person_said: str):
+        """Background task: extract and store facts from what someone said."""
+        person = self.memory.get(track_id)
+        known_facts = person.facts if person else []
+        new_facts = self.llm.extract_facts(person_said, known_facts)
+        for fact in new_facts:
+            self.memory.add_fact(track_id, fact)
+            logger.info(f"[AGENT] new fact for track {track_id}: {fact}")
 
     def _emit(self, etype, payload):
         event = AgentEvent(type=etype, timestamp=time.time(), payload=payload)

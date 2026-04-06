@@ -168,3 +168,34 @@ Reply in their language. One sentence."""
         prompt = "An unknown person just appeared on camera. Ask them for their name in a friendly way. One short sentence."
         return self._call_llm(prompt, "ask_name",
                               "Hello! I don't think we've met. What is your name?")
+
+    def extract_facts(self, person_said: str, known_facts: list[str]) -> list[str]:
+        """Extract personal facts from what someone said.
+
+        Returns a list of new facts (empty if nothing worth remembering).
+        Runs as a background call after each conversation exchange.
+        """
+        known = "\n".join(f"- {f}" for f in known_facts) if known_facts else "None"
+
+        prompt = f"""Extract personal facts from what this person just said.
+Only extract concrete, lasting facts about them (e.g. job, hobbies, family,
+where they live, what they like/dislike). Skip greetings, small talk, and
+things we already know.
+
+Already known facts:
+{known}
+
+They said: "{person_said}"
+
+Reply with one fact per line, no bullets or numbering. If nothing new, reply NONE."""
+
+        result = self._call_llm(prompt, "extract_facts", "NONE")
+        if not result or result.strip().upper() == "NONE":
+            return []
+
+        facts = []
+        for line in result.strip().splitlines():
+            line = line.strip().lstrip("-•* 0123456789.)")
+            if line and line.upper() != "NONE" and len(line) > 3:
+                facts.append(line)
+        return facts
