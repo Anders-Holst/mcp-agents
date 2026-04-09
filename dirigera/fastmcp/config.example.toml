@@ -1,0 +1,10 @@
+[dirigera]
+host = "192.168.1.200"
+token = "your-dirigera-token-here"
+
+# Optional: JWT authentication for remote access (used with --auth flag)
+# If omitted when --auth is used, secrets are auto-generated and saved here.
+#[auth]
+#jwt_secret = "your-jwt-secret-hex"
+#api_key = "your-api-key-hex"
+#expiry_hours = 24
