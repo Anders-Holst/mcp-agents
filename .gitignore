@@ -16,8 +16,5 @@ __pycache__/
 env.sh
 .env
 
-# Locks (optional - can be committed)
-uv.lock
-
 # Output files
 *.png
