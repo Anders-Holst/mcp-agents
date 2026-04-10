@@ -168,8 +168,14 @@ def language_message(lang):
     msg = f"Reply in {reply_language}!"
     return {"role": "system", "content": msg}
 
-### greetprompt
-def greet_prompt()
+def greet_prompt():
+    global state
+    if not curr_person.name:
+        return {'role':'system', 'content':'There is a new person in front of you. Produce a greeting and ask for the name.'}
+    else:
+        dur = time.time() - curr_person.last_time
+        duration = int(dur/60)
+        return {'role':'system', 'content': f'The person {curr_person.name} has appeared in front of you. It was {duration} minutes since you last met. Produce a suitable greeting.'}
 
 def compose_messages(sysp, mlst, augs):
     n = 0
