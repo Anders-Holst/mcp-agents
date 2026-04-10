@@ -38,9 +38,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Screenshot MCP Server')
     parser.add_argument('--host', default="127.0.0.1", help='Host to bind to')
     parser.add_argument('--port', default=8000, type=int, help='Port to bind to')
-    parser.add_argument('--transport', default="stdio", help='Transport to use (stdio, sse or http)')
+    parser.add_argument('--transport', default="stdio", help='Transport to use (stdio, sse or streamable-http)')
     args = parser.parse_args()
-    if args.transport != "stdio":
-        mcp.run(transport=args.transport, host=args.host, port=args.port)
-    else:
+    if args.transport == "stdio":
         mcp.run()
+    else:
+        transport = "streamable-http" if args.transport == "http" else args.transport
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        mcp.run(transport=transport, host=args.host, port=args.port)

@@ -11,12 +11,17 @@ widgets.
 
 """
 
-import matplotlib.pyplot as plt
+import sys
 import matplotlib as mpl
+
+# macOS cpython-standalone (used by uv) doesn't bundle Tcl/Tk, so TkAgg fails.
+# Prefer the native MacOSX backend there; TkAgg elsewhere.
+mpl.use("MacOSX" if sys.platform == "darwin" else "TkAgg")
+
+import matplotlib.pyplot as plt
 
 mpl.interactive(True)
 mpl.rcParams["toolbar"] = "None"
-mpl.rcParams["backend"] = "TkAgg"
 
 
 class WindowMgr:

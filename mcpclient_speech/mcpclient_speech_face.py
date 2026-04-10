@@ -8,16 +8,28 @@ from fastmcp import Client, exceptions
 from fastmcp.client.transports import SSETransport
 import base64
 import json
+import os
+import threading
 import time
 import sys
 
 import openai
 from openai import OpenAI
 
+# voice_input / voice_output / face_tracker live in ../face/
+_FACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'face')
+if _FACE_DIR not in sys.path:
+    sys.path.insert(0, _FACE_DIR)
+
 from readnb import *
 from eyewindow import *
 from record import *
-from voice_input import *
+from voice_input import VoiceInput, ContinuousListener, VoiceEventType
+from voice_output import VoiceOutput
+from face_tracker import (
+    FaceTracker, FaceDatabase, EmotionDetector, FaceEventType,
+)
+import cv2
 
 ollama_config = {
     "model": "PetrosStav/gemma3-tools:12b",
@@ -52,40 +64,41 @@ curr_person = None
 curr_prompt = ""
 
 win: EyeWindow | None = None
+voice_in: VoiceInput | None = None
+voice_out: VoiceOutput | None = None
+listener: ContinuousListener | None = None
+tracker: FaceTracker | None = None
 
 def on_exit(state):
     state['evtime'] = time.time()
     state['newstate'] = 'exit'
 
 def on_face_change(id):
-    global messages, state
+    global messages, state, curr_person
     if state['newstate'] == 'exit':
         return
+    if curr_person:
+        curr_person.lasttime = time.time()
+        curr_person.lastmessages = messages
     if id is None:
-        if curr_person:
-            curr_person.last_time = time.time()
-            curr_person.last_messages = messages
         messages = []
         curr_person = None
         state['evtime'] = time.time()
         state['newstate'] = 'wait'
     else:
-        curr_prompt.last_time = time.time()
-        curr_prompt.last_messages = messages
         if id in persondict:
             curr_person = persondict[id]
-            messages = curr_person.messages
-            state['evtime'] = time.time()
-            state['newstate'] = 'greet'
+            messages = list(curr_person.lastmessages or [])
         else:
             curr_person = Person(None)
-            messages = curr_person.messages
-            state['evtime'] = time.time()
-            state['newstate'] = 'greet'
+            persondict[id] = curr_person
+            messages = []
+        state['evtime'] = time.time()
+        state['newstate'] = 'greet'
 
 def on_speech(txt):
     global curr_prompt, state
-    if state['newstate'] is None or state['newstate'] == 'listen':
+    if state['currstate'] == 'listen' and state['newstate'] is None:
         curr_prompt = txt
         state['evtime'] = time.time()
         state['newstate'] = 'process'
@@ -169,13 +182,12 @@ def language_message(lang):
     return {"role": "system", "content": msg}
 
 def greet_prompt():
-    global state
     if not curr_person.name:
         return {'role':'system', 'content':'There is a new person in front of you. Produce a greeting and ask for the name.'}
-    else:
-        dur = time.time() - curr_person.last_time
-        duration = int(dur/60)
-        return {'role':'system', 'content': f'The person {curr_person.name} has appeared in front of you. It was {duration} minutes since you last met. Produce a suitable greeting.'}
+    if curr_person.lasttime is None:
+        return {'role':'system', 'content': f'The person {curr_person.name} has appeared in front of you. Produce a suitable greeting.'}
+    duration = int((time.time() - curr_person.lasttime) / 60)
+    return {'role':'system', 'content': f'The person {curr_person.name} has appeared in front of you. It was {duration} minutes since you last met. Produce a suitable greeting.'}
 
 def compose_messages(sysp, mlst, augs):
     n = 0
@@ -219,9 +231,11 @@ async def main():
     global has_name
     global has_init
     global has_exit
+    global voice_in, voice_out, listener, tracker
+    global curr_prompt
 
     # Connect via stdio to a local script
-    async with Client(transport=SSETransport("http://127.0.0.1:8000/sse")) as client:
+    async with Client(transport=SSETransport("http://127.0.0.1:7999/sse")) as client:
         ### Initialization phase
 
         # Check MCP server capabilities
@@ -271,7 +285,7 @@ async def main():
                  'talk':      ((0.95, 0.75, 0), "~~~", ""),
                  }
         if has_name:
-            tmp = await client.read_resource("url://service_name")
+            tmp = await client.read_resource("url://get_service_name")
             name = tmp[0].text
         else:
             name = "MCP Speech Client"
@@ -282,8 +296,58 @@ async def main():
         print('Created the interaction window')
 
         ### Initialize voice_input library, as ContinuousListener with on_speech as callback here
+        voice_in = VoiceInput()
+        voice_in.subscribe(
+            lambda ev: on_speech(ev.payload.text),
+            event_types={VoiceEventType.TRANSCRIPTION_COMPLETE},
+        )
+        print('Loading whisper model...')
+        voice_in.load_sync()
+        if not voice_in.ready:
+            print('Failed to load whisper model')
+            return False
+        listener = ContinuousListener(voice_in)
+        listener.start()
+        print('Continuous listener started')
+
+        ### Initialize voice_output (piper TTS)
+        voice_out = VoiceOutput()
+        print('Loading piper model...')
+        voice_out.load_sync()
+        if not voice_out.ready:
+            print('Failed to load piper model')
+            return False
 
         ### Initialize the face_tracker here, with on_face_change as callback
+        face_db = FaceDatabase()
+        face_db.load()
+        emotion_detector = EmotionDetector()
+        tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector)
+
+        def _on_face_event(ev):
+            new_id = ev.payload.new_track_id
+            on_face_change(new_id if new_id else None)
+
+        tracker.subscribe(_on_face_event,
+                          event_types={FaceEventType.FOCUS_CHANGED})
+
+        def _camera_loop():
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                print('Could not open camera 0')
+                return
+            try:
+                while state.get('currstate') != 'exit' and state.get('newstate') != 'exit':
+                    ret, frame = cap.read()
+                    if not ret:
+                        time.sleep(0.05)
+                        continue
+                    tracker.process_frame(frame)
+            finally:
+                cap.release()
+
+        threading.Thread(target=_camera_loop, daemon=True).start()
+        print('Face tracker started')
 
         if has_init:
             ok = await client.read_resource("url://service_init")
@@ -342,8 +406,27 @@ async def main():
     
             if newstate == 'exit':
                 break
-    
+
+            if newstate in ('wait', 'listen'):
+                set_state(state, newstate)
+                if listener:
+                    listener.paused = (newstate != 'listen')
+                newstate = False
+                continue
+
             if newstate == 'process' or newstate == 'greet':
+                set_state(state, newstate)
+                if listener:
+                    listener.paused = True
+
+                if newstate == 'process':
+                    # prompt came from speech (curr_prompt) or stdin (prompt)
+                    if curr_prompt:
+                        prompt = curr_prompt
+                        if voice_in and voice_in.detected_language:
+                            lang = voice_in.detected_language
+                        curr_prompt = ""
+
                 langprompt = language_message(lang)
                 sysprompt = await system_message(client, lang)
                 augprompt = await augmentation_message(client, lang)
@@ -357,8 +440,9 @@ async def main():
                     if greetprompt:
                         augpromptlist.append(greetprompt)
                 augpromptlist.append(langprompt)
-                print("\n  User: (", lang, ") ", prompt)
-                messages.append(user_message(prompt))
+                if newstate == 'process':
+                    print("\n  User: (", lang, ") ", prompt)
+                    messages.append(user_message(prompt))
 
                 response = openai.chat.completions.create(
                     model=model,
@@ -396,18 +480,21 @@ async def main():
     
                     response = openai.chat.completions.create(
                         model=model,
-                        messages=compose_messages(sysprompt, messages, augprompt, lang),
+                        messages=compose_messages(sysprompt, messages, augpromptlist),
                         tools=tools,
                     )
                     tool_calls = response.choices[0].message.tool_calls
-    
+
                 # No tool calls, just print the response.
                 messages.append(response.choices[0].message)
-                print(f'\n  Response: {response.choices[0].message.content}')
-                set_win_state(state, 'talking')
-                ### use the new speech library ?
-                speak(response.choices[0].message.content, lang)
+                reply_text = response.choices[0].message.content or ""
+                print(f'\n  Response: {reply_text}')
+                set_win_state('talk')
+                if reply_text:
+                    voice_out.speak(reply_text)
                 set_state(state, 'listen')
+                if listener:
+                    listener.paused = False
                 newstate = False
     
         if has_exit:
