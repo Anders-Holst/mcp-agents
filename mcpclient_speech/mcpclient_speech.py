@@ -19,7 +19,7 @@ from eyewindow import *
 from record import *
 
 ollama_config = {
-    "model": "llama3.1",
+    "model": "PetrosStav/gemma3-tools:12b",
     "base_url": "http://localhost:11434/v1/",
     "api_key": "ollama"
 }
@@ -107,10 +107,6 @@ async def system_message(client, lang):
         txt = "You are a helpful assistant that can control various devices."
     return {"role": "system", "content": txt}
 
-#        cpr = await client.read_resource("url://service_prompt")
-#        cpr = cpr[0].text
-#    sysprompt = {"role": "system", "content": cpr}
-
 async def augmentation_message(client, lang):
     if has_augprompt:
         if has_augprompt_lang:
@@ -125,7 +121,19 @@ async def augmentation_message(client, lang):
 def user_message(prompt):
     return {"role": "user", "content": prompt}
 
-def compose_messages(sysp, mlst, aug, lang):
+def language_message(lang):
+    languages = { "en": "English",
+                  "sv": "Swedish",
+                  "de": "Deutch",
+                  "fr": "French",
+                  "es": "Spanish"}
+    if not lang in languages:
+        lang = 'en'
+    reply_language = languages[lang]
+    msg = f"Reply in {reply_language}!"
+    return {"role": "system", "content": msg}
+    
+def compose_messages(sysp, mlst, aug, langmsg):
     n = 0
     i1 = 0
     i2 = 0
@@ -137,7 +145,8 @@ def compose_messages(sysp, mlst, aug, lang):
             if n == messages_trunclen:
                 i1 = i
                 break
-    return [sysp] + mlst[i1:i2] + ([aug] if aug else []) + mlst[i2:]
+
+    return [sysp] + mlst[i1:i2] + ([aug] if aug else []) + [langmsg] + mlst[i2:]
 
 def clear_messages():
     global messages
@@ -180,11 +189,11 @@ async def main():
         print("\nAvailable resources:")
         for res in ress:
             print(res)
-            if res.name == 'url://service_name':
+            if res.name == 'get_service_name':
                 has_name = True
-            if res.name == 'url://service_init':
+            elif res.name == 'service_init':
                 has_init = True
-            if res.name == 'url://service_exit':
+            elif res.name == 'service_exit':
                 has_exit = True
         
         prompts = await client.list_prompts()
@@ -211,7 +220,8 @@ async def main():
 
         make_nonblocking(sys.stdin)
 
-        if init_audio(microphone_name="sof-hda-dsp", sample_rate=16000):
+        #if init_audio(microphone_name="sof-hda-dsp", sample_rate=16000):
+        if init_audio():
             print('Initialized speech recognition and synthesis')
         else:
             print('Error: failed to initialize audio')
@@ -256,6 +266,7 @@ async def main():
         lang = False
         prompt = ""
         txtlang = 'en'
+        langprompt = False
         sysprompt = False
         augprompt = False
         while True:
@@ -301,6 +312,7 @@ async def main():
     
             if newstate == 'processing':
                 if not repeat:
+                    langprompt = language_message(lang)
                     sysprompt = await system_message(client, lang)
                     augprompt = await augmentation_message(client, lang)
                     if augprompt:
@@ -313,7 +325,7 @@ async def main():
 
                 response = openai.chat.completions.create(
                     model=model,
-                    messages=compose_messages(sysprompt, messages, augprompt, lang),
+                    messages=compose_messages(sysprompt, messages, augprompt, langprompt),
                     tools=tools,
                 )
     
