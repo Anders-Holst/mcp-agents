@@ -1,14 +1,18 @@
 """
-People memory module: stores per-person data (dialogues, facts, preferences).
+People memory module: stores per-person data (dialogues, facts, asked topics).
 
-All lookups are by face track_id. A person may or may not have a name.
-Persists as JSON files — one per person in a configurable directory.
+People are keyed by a stable ``person_id`` (e.g. ``p001``) that never
+changes, even on rename. Each person has one JSON file at
+``{storage_dir}/{person_id}.json``; the display name lives inside that
+JSON and is the single source of truth for what to call the person.
 
-Can be used standalone or as part of the larger system.
+At runtime the active session maps ``track_id -> Person`` via
+``identify(track_id, person_id)``.
 """
 
 import json
 import os
+import re
 import time
 import threading
 import logging
@@ -17,6 +21,20 @@ from datetime import datetime
 from typing import Optional
 
 logger = logging.getLogger("people_memory")
+
+
+# Interview topics: small-talk questions the agent asks during greetings
+# to build up a person's profile over time. One topic per greeting; once
+# the topic has been asked it goes into ``person.asked_topics`` and we
+# move on, regardless of whether the user actually answered. Whatever
+# they say in response is captured by ``extract_facts`` like everything
+# else — there's no separate slot storage anymore.
+INTERVIEW_TOPICS: list[str] = [
+    "favourite_colour",
+    "hobby",
+    "favourite_food",
+    "favourite_music",
+]
 
 
 @dataclass
@@ -42,10 +60,10 @@ class Person:
 
     dialogues: list[DialogueEntry] = field(default_factory=list)
     facts: list[str] = field(default_factory=list)
-    preferences: dict = field(default_factory=dict)
+    asked_topics: list[str] = field(default_factory=list)
     summary: str = ""
 
-    # Persistent ID for linking across sessions (set from face_db name or generated)
+    # Persistent ID (e.g. "p001") — stable across renames, matches filename.
     persistent_id: str = ""
 
     @property
@@ -62,7 +80,7 @@ class Person:
             "times_seen": self.times_seen,
             "emotion": self.emotion,
             "facts": self.facts,
-            "preferences": self.preferences,
+            "asked_topics": self.asked_topics,
             "summary": self.summary,
             "dialogues": [
                 {
@@ -90,9 +108,13 @@ class Person:
             emotion=d.get("emotion", ""),
             dialogues=dialogues,
             facts=d.get("facts", []),
-            preferences=d.get("preferences", {}),
+            asked_topics=d.get("asked_topics", []),
             summary=d.get("summary", ""),
         )
+
+    def missing_topics(self) -> list[str]:
+        """Interview topics we haven't asked this person about yet."""
+        return [t for t in INTERVIEW_TOPICS if t not in self.asked_topics]
 
     @property
     def first_met_dt(self) -> Optional[datetime]:
@@ -117,18 +139,22 @@ class Person:
         return time.time() - self.last_talked
 
 
+_PERSON_ID_RE = re.compile(r"^p(\d+)$")
+
+
 class PeopleMemory:
     """In-memory people database with JSON file persistence.
 
-    Primary lookup is by track_id (current session).
-    Named people are persisted to disk and restored when re-identified.
+    Each stored person has a stable ``person_id`` (e.g. ``p001``) which
+    is the filename and the key in ``_stored``. Display names live inside
+    the JSON and can be changed freely without touching the ID.
     """
 
     def __init__(self, storage_dir: str = "people"):
         self._dir = storage_dir
         # Active session: track_id -> Person
         self._active: dict[int, Person] = {}
-        # Persistent store: persistent_id -> Person dict (loaded from disk)
+        # Persistent store: person_id -> Person dict (loaded from disk)
         self._stored: dict[str, dict] = {}
         self._lock = threading.Lock()
 
@@ -143,12 +169,37 @@ class PeopleMemory:
             try:
                 with open(fpath, "r") as f:
                     data = json.load(f)
-                pid = data.get("persistent_id") or data.get("name") or fname[:-5]
-                self._stored[pid.lower()] = data
+                pid = fname[:-5]
+                data["persistent_id"] = pid
+                self._stored[pid] = data
                 count += 1
             except Exception as e:
                 logger.warning(f"Failed to load {fpath}: {e}")
         logger.info(f"People memory loaded: {count} people from {self._dir}/")
+
+    def next_person_id(self) -> str:
+        """Allocate the next free p### ID by scanning stored records."""
+        with self._lock:
+            max_n = 0
+            for pid in self._stored:
+                m = _PERSON_ID_RE.match(pid)
+                if m:
+                    max_n = max(max_n, int(m.group(1)))
+        return f"p{max_n + 1:03d}"
+
+    def create_person(self, track_id: int, name: str) -> str:
+        """Allocate a new person_id, attach it to the active track, persist.
+
+        Returns the new person_id so callers (e.g. the face tracker) can
+        store it alongside the face encoding.
+        """
+        person_id = self.next_person_id()
+        person = self.get_or_create(track_id)
+        person.name = name
+        person.persistent_id = person_id
+        logger.info(f"Created person {person_id!r} ({name}) for track {track_id}")
+        self._save(person)
+        return person_id
 
     # --- Lookup by track_id ---
 
@@ -170,37 +221,40 @@ class PeopleMemory:
                 )
             return self._active[track_id]
 
-    def identify(self, track_id: int, name: str):
-        """Associate a track_id with a name. Loads persistent data if available."""
-        person = self.get_or_create(track_id)
-        pid = name.lower()
+    def identify(self, track_id: int, person_id: str):
+        """Link a track_id to an existing stored person by ID.
 
-        # Load persistent history if this is a known person
+        Loads the JSON record, uses its stored ``name`` as the display
+        name, and restores facts / asked_topics / dialogues. If no JSON
+        exists for ``person_id`` this is a no-op — use ``create_person``
+        for new people.
+        """
         with self._lock:
-            stored = self._stored.get(pid)
+            stored = self._stored.get(person_id)
+        if not stored:
+            logger.warning(f"identify: no stored record for {person_id!r}")
+            return
 
-        if stored and not person.is_identified:
-            # Merge stored data into the active person
-            person.name = name
-            person.persistent_id = pid
-            person.facts = stored.get("facts", [])
-            person.preferences = stored.get("preferences", {})
-            person.summary = stored.get("summary", "")
-            # Restore dialogue history from disk
-            person.dialogues = [
-                DialogueEntry(**e) for e in stored.get("dialogues", [])
-            ]
-            person.times_seen = stored.get("times_seen", 0) + 1
-            stored_first = stored.get("first_met", 0.0)
-            if stored_first and stored_first < person.first_met:
-                person.first_met = stored_first
-            logger.info(f"Identified track {track_id} as {name} (restored {len(person.dialogues)} dialogues, {len(person.facts)} facts)")
-        else:
-            person.name = name
-            person.persistent_id = pid
-            if not person.is_identified:
-                logger.info(f"Identified track {track_id} as {name} (new person)")
+        person = self.get_or_create(track_id)
+        if person.persistent_id == person_id:
+            return  # already identified
 
+        person.persistent_id = person_id
+        person.name = stored.get("name") or person_id
+        person.facts = list(stored.get("facts", []))
+        person.asked_topics = list(stored.get("asked_topics", []))
+        person.summary = stored.get("summary", "")
+        person.dialogues = [
+            DialogueEntry(**e) for e in stored.get("dialogues", [])
+        ]
+        person.times_seen = stored.get("times_seen", 0) + 1
+        stored_first = stored.get("first_met", 0.0)
+        if stored_first and stored_first < person.first_met:
+            person.first_met = stored_first
+        logger.info(
+            f"Identified track {track_id} as {person.name} ({person_id}, "
+            f"restored {len(person.dialogues)} dialogues, {len(person.facts)} facts)"
+        )
         self._save(person)
 
     def remove_track(self, track_id: int):
@@ -211,19 +265,29 @@ class PeopleMemory:
         if person and person.is_identified:
             self._save(person)
 
-    # --- Lookup by name (for persistent queries) ---
+    # --- Lookup by name or ID (for persistent queries) ---
 
-    def get_by_name(self, name: str) -> Optional[Person]:
-        """Find an active person by name, or load from disk."""
-        # Check active first
+    def get_by_id(self, person_id: str) -> Optional[Person]:
+        """Find a stored person by ID, loading from disk if needed."""
         with self._lock:
             for p in self._active.values():
-                if p.name and p.name.lower() == name.lower():
+                if p.persistent_id == person_id:
                     return p
-        # Fall back to stored
-        stored = self._stored.get(name.lower())
+            stored = self._stored.get(person_id)
         if stored:
             return Person.from_dict(stored)
+        return None
+
+    def get_by_name(self, name: str) -> Optional[Person]:
+        """Find a person by display name (case-insensitive linear scan)."""
+        needle = name.lower()
+        with self._lock:
+            for p in self._active.values():
+                if p.name and p.name.lower() == needle:
+                    return p
+            for stored in self._stored.values():
+                if (stored.get("name") or "").lower() == needle:
+                    return Person.from_dict(stored)
         return None
 
     @property
@@ -234,7 +298,14 @@ class PeopleMemory:
     @property
     def known_names(self) -> list[str]:
         """All names that have been persisted."""
-        return [d.get("name", k) for k, d in self._stored.items() if d.get("name")]
+        with self._lock:
+            return [d.get("name", pid) for pid, d in self._stored.items()]
+
+    @property
+    def known_person_ids(self) -> list[str]:
+        """All stored person IDs."""
+        with self._lock:
+            return list(self._stored.keys())
 
     @property
     def active_count(self) -> int:
@@ -251,7 +322,6 @@ class PeopleMemory:
         person.last_seen = now
         if emotion:
             person.emotion = emotion
-            person.preferences["last_emotion"] = emotion
 
     def add_dialogue(self, track_id: int, speaker: str, text: str,
                      language: str = "", emotion: str = ""):
@@ -274,9 +344,28 @@ class PeopleMemory:
             if person.is_identified:
                 self._save(person)
 
-    def set_preference(self, track_id: int, key: str, value):
+    def replace_fact(self, track_id: int, old_fact: str, new_fact: str):
+        """Replace an existing fact with an updated version."""
         person = self.get_or_create(track_id)
-        person.preferences[key] = value
+        try:
+            idx = person.facts.index(old_fact)
+            person.facts[idx] = new_fact
+            logger.info(f"Replaced fact for track {track_id} ({person.name or '?'}): "
+                        f"{old_fact!r} -> {new_fact!r}")
+        except ValueError:
+            person.facts.append(new_fact)
+            logger.info(f"New fact (replace miss) for track {track_id}: {new_fact}")
+        if person.is_identified:
+            self._save(person)
+
+    def mark_topic_asked(self, track_id: int, topic: str):
+        """Record that we've asked this person about ``topic``."""
+        person = self.get_or_create(track_id)
+        if topic not in person.asked_topics:
+            person.asked_topics.append(topic)
+            logger.info(f"Asked track {track_id} ({person.name or '?'}) about {topic}")
+            if person.is_identified:
+                self._save(person)
 
     def update_summary(self, track_id: int, summary: str):
         person = self.get_or_create(track_id)
@@ -327,10 +416,6 @@ class PeopleMemory:
         if person.facts:
             lines.append(f"Known facts: {'; '.join(person.facts)}")
 
-        if person.preferences:
-            prefs = ", ".join(f"{k}={v}" for k, v in person.preferences.items())
-            lines.append(f"Preferences: {prefs}")
-
         if person.summary:
             lines.append(f"Relationship summary: {person.summary}")
 
@@ -370,9 +455,8 @@ class PeopleMemory:
         """Save a person to disk (only if identified)."""
         if not person.is_identified or not person.persistent_id:
             return
+        pid = person.persistent_id
         data = person.to_dict()
-        pid = person.persistent_id.lower()
-        # Update stored cache
         with self._lock:
             self._stored[pid] = data
         os.makedirs(self._dir, exist_ok=True)
@@ -386,6 +470,40 @@ class PeopleMemory:
             people = [p for p in self._active.values() if p.is_identified]
         for p in people:
             self._save(p)
+
+    def delete(self, person_id: str) -> bool:
+        """Remove a person from memory and disk by ID."""
+        removed = False
+        with self._lock:
+            if person_id in self._stored:
+                del self._stored[person_id]
+                removed = True
+            for tid in [t for t, p in self._active.items()
+                        if p.persistent_id == person_id]:
+                del self._active[tid]
+                removed = True
+        fpath = os.path.join(self._dir, f"{person_id}.json")
+        if os.path.exists(fpath):
+            os.remove(fpath)
+            removed = True
+        return removed
+
+    def rename(self, person_id: str, new_name: str) -> bool:
+        """Update the display name of a stored person. ID stays the same."""
+        with self._lock:
+            stored = self._stored.get(person_id)
+            if not stored:
+                return False
+            stored["name"] = new_name
+            for p in self._active.values():
+                if p.persistent_id == person_id:
+                    p.name = new_name
+
+        fpath = os.path.join(self._dir, f"{person_id}.json")
+        with open(fpath, "w") as f:
+            json.dump(stored, f, indent=2, ensure_ascii=False)
+        logger.info(f"Renamed {person_id} -> {new_name!r}")
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +525,7 @@ def main():
     fact_p = sub.add_parser("add-fact", help="Add a fact about a person")
     fact_p.add_argument("name")
     fact_p.add_argument("fact")
+    sub.add_parser("shell", help="Interactive shell for poking at people memory")
 
     args = parser.parse_args()
 
@@ -457,13 +576,16 @@ def main():
         person = mem.get_by_name(args.name)
         if not person:
             print(f"No person named '{args.name}', creating...")
-            mem.get_or_create(0)
-            mem.identify(0, args.name)
+            mem.create_person(0, args.name)
             person = mem.get(0)
         else:
             mem._active[0] = person
         mem.add_fact(0 if person.track_id == 0 else person.track_id, args.fact)
         print(f"Added fact about {args.name}: {args.fact}")
+
+    elif args.command == "shell":
+        from debug_shell import run_shell
+        run_shell(mem)
 
 
 if __name__ == "__main__":

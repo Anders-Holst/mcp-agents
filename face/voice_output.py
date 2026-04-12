@@ -124,6 +124,8 @@ class VoiceOutput:
         self._piper_voice = None
         self._ready = False
         self._speaking = False
+        self._stop_event = threading.Event()
+        self._interrupted = False
         self._lock = threading.Lock()
         self._dispatcher = EventDispatcher(owner="voice_output")
 
@@ -187,19 +189,34 @@ class VoiceOutput:
 
     # --- Core ---
 
+    @property
+    def interrupted(self) -> bool:
+        """True if the last speak() was cut short by stop_speaking()."""
+        return self._interrupted
+
+    def stop_speaking(self):
+        """Interrupt the current TTS playback. Safe to call from any thread."""
+        self._stop_event.set()
+
     def speak(self, text: str):
-        """Blocking TTS: synthesize and play. Thread-safe."""
+        """Blocking TTS: synthesize and play. Thread-safe.
+
+        Can be interrupted mid-playback via ``stop_speaking()``.
+        After returning, check ``interrupted`` to know if it was cut short.
+        """
         if not self._ready:
             logger.warning(f"TTS not ready, would say: {text}")
             return
 
-        if not self._lock.acquire(timeout=0.1):
+        if not self._lock.acquire(timeout=0.5):
             self._emit(TtsEventType.TTS_BUSY, TtsBusyPayload(text))
             logger.warning(f"TTS busy, rejected: {text}")
             return
 
         try:
             self._speaking = True
+            self._interrupted = False
+            self._stop_event.clear()
             start = time.time()
             self._emit(TtsEventType.TTS_STARTED, TtsStartedPayload(text))
             self._play(text)
@@ -218,8 +235,12 @@ class VoiceOutput:
         sr = self._piper_voice.config.sample_rate
         buffer = []
         finished = threading.Event()
+        stop = self._stop_event
 
         def callback(outdata, frames, time_info, status):
+            if stop.is_set():
+                outdata[:, 0] = 0
+                raise sd.CallbackStop
             if buffer:
                 chunk = buffer.pop(0)
                 if len(chunk) < frames:
@@ -240,11 +261,19 @@ class VoiceOutput:
         )
         stream.start()
         for audio_chunk in self._piper_voice.synthesize(text):
+            if stop.is_set():
+                break
             buffer.append(audio_chunk.audio_float_array)
         finished.set()
         while stream.active:
+            if stop.is_set():
+                stream.abort()
+                break
             sd.sleep(50)
         stream.close()
+        if stop.is_set():
+            self._interrupted = True
+            logger.info("[TTS] Playback interrupted by stop_speaking()")
 
     def _emit(self, etype, payload):
         event = TtsEvent(type=etype, timestamp=time.time(), payload=payload)

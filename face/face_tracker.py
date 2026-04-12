@@ -3,13 +3,15 @@ Face detection, recognition, and tracking module.
 
 Provides stable face tracking across video frames with:
 - Persistent tracking IDs (survive brief occlusions)
-- Recognition with hysteresis (no name flickering)
+- Recognition with hysteresis (no identity flickering)
 - Emotion detection
 - Face database management
 - Typed event system with subscribe/unsubscribe
 
 TrackedFace is pure tracking data (ID, bbox, encoding, emotion).
-Identity (name) is a separate concern managed by FaceTracker.
+Identity (``person_id``) is a separate concern managed by FaceTracker.
+Display names are resolved externally via ``PeopleMemory``; the tracker
+itself only knows stable person IDs.
 
 Can be run standalone:
     python face_tracker.py [--db-dir known_faces] [--camera 0]
@@ -62,14 +64,14 @@ class FaceAppearedPayload:
     bbox: tuple
     emotion: str
     emotion_confidence: float
-    initial_name: Optional[str]
+    initial_person_id: Optional[str]
     initial_confidence: float
 
 
 @dataclass(frozen=True)
 class FaceDisappearedPayload:
     last_bbox: tuple
-    name: Optional[str]
+    person_id: Optional[str]
     duration_visible: float
     total_frames: int
 
@@ -77,38 +79,38 @@ class FaceDisappearedPayload:
 @dataclass(frozen=True)
 class FaceOccludedPayload:
     last_bbox: tuple
-    name: Optional[str]
+    person_id: Optional[str]
 
 
 @dataclass(frozen=True)
 class FaceRecoveredPayload:
     bbox: tuple
-    name: Optional[str]
+    person_id: Optional[str]
     seconds_missing: float
 
 
 @dataclass(frozen=True)
 class IdentityConfirmedPayload:
-    name: str
+    person_id: str
     confidence: float
     last_seen_timestamp: Optional[float]
 
 
 @dataclass(frozen=True)
 class IdentityLostPayload:
-    previous_name: str
+    previous_person_id: str
 
 
 @dataclass(frozen=True)
 class IdentityChangedPayload:
-    old_name: str
-    new_name: str
+    old_person_id: str
+    new_person_id: str
     new_confidence: float
 
 
 @dataclass(frozen=True)
 class FaceLearnedPayload:
-    name: str
+    person_id: str
 
 
 @dataclass(frozen=True)
@@ -117,7 +119,7 @@ class FocusChangedPayload:
     new_track_id: int
     old_focus_score: float
     new_focus_score: float
-    new_name: Optional[str]
+    new_person_id: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -125,7 +127,7 @@ class EmotionChangedPayload:
     old_emotion: str
     new_emotion: str
     new_confidence: float
-    name: Optional[str]
+    person_id: Optional[str]
 
 
 FaceEventPayload = Union[
@@ -182,12 +184,12 @@ class TrackedFace:
 
 @dataclass
 class Identity:
-    """Recognition result for a tracked face."""
-    name: str
+    """Recognition result for a tracked face, keyed by stable person_id."""
+    person_id: str
     confidence: float
     _matching_since: float = field(default=0.0, repr=False)
     _failing_since: float = field(default=0.0, repr=False)
-    _candidate_name: str = field(default="", repr=False)
+    _candidate_person_id: str = field(default="", repr=False)
     _candidate_confidence: float = field(default=0.0, repr=False)
     _confirmed: bool = field(default=False, repr=False)
 
@@ -197,12 +199,19 @@ class Identity:
 # ---------------------------------------------------------------------------
 
 class FaceDatabase:
-    """Persistent face encoding database. Compatible with existing faces.pkl format."""
+    """Persistent face encoding database keyed by stable person_id."""
+
+    SCHEMA_VERSION = 2
 
     def __init__(self, db_dir: str = "known_faces", tolerance: float = 0.6):
         self.db_dir = db_dir
         self.tolerance = tolerance
-        self._db = {"encodings": [], "names": [], "last_seen": {}}
+        self._db = {
+            "encodings": [],
+            "person_ids": [],
+            "last_seen": {},
+            "schema_version": self.SCHEMA_VERSION,
+        }
         self._lock = threading.Lock()
 
     def load(self):
@@ -210,9 +219,13 @@ class FaceDatabase:
         if os.path.exists(db_file):
             with open(db_file, "rb") as f:
                 self._db = pickle.load(f)
-            if "last_seen" not in self._db:
-                self._db["last_seen"] = {}
-        logger.info(f"Database loaded: {len(self.known_names)} people, {self.encoding_count} encodings")
+            self._db.setdefault("last_seen", {})
+            self._db.setdefault("person_ids", [])
+            self._db.setdefault("schema_version", self.SCHEMA_VERSION)
+        logger.info(
+            f"Database loaded: {len(self.known_person_ids)} people, "
+            f"{self.encoding_count} encodings"
+        )
 
     def save(self):
         os.makedirs(self.db_dir, exist_ok=True)
@@ -229,36 +242,62 @@ class FaceDatabase:
             best_idx = np.argmin(distances)
             best_dist = distances[best_idx]
             if best_dist < self.tolerance:
-                name = self._db["names"][best_idx]
+                person_id = self._db["person_ids"][best_idx]
                 confidence = max(0.0, 1.0 - best_dist) * 100
-                return (name, confidence)
+                return (person_id, confidence)
             return (None, 0.0)
 
-    def add_face(self, name: str, encoding: np.ndarray,
+    def add_face(self, person_id: str, encoding: np.ndarray,
                  frame: np.ndarray, bbox: tuple):
         with self._lock:
             self._db["encodings"].append(encoding)
-            self._db["names"].append(name)
+            self._db["person_ids"].append(person_id)
+            sample_count = self._db["person_ids"].count(person_id)
         self.save()
-        self._save_face_image(name, frame, bbox)
-        logger.info(f"Added face for '{name}' ({self._db['names'].count(name)} samples)")
+        self._save_face_image(person_id, frame, bbox)
+        logger.info(f"Added face for {person_id!r} ({sample_count} samples)")
 
-    def update_last_seen(self, name: str):
+    def update_last_seen(self, person_id: str):
         with self._lock:
-            self._db["last_seen"][name] = datetime.now().timestamp()
+            self._db["last_seen"][person_id] = datetime.now().timestamp()
 
-    def get_last_seen(self, name: str) -> Optional[float]:
-        return self._db["last_seen"].get(name)
+    def get_last_seen(self, person_id: str) -> Optional[float]:
+        return self._db["last_seen"].get(person_id)
 
     def clear(self):
         with self._lock:
-            self._db = {"encodings": [], "names": [], "last_seen": {}}
+            self._db = {
+                "encodings": [],
+                "person_ids": [],
+                "last_seen": {},
+                "schema_version": self.SCHEMA_VERSION,
+            }
         self.save()
         logger.info("Database cleared")
 
+    def remove_person(self, person_id: str) -> int:
+        """Drop all encodings for ``person_id``. Returns number removed."""
+        with self._lock:
+            keep_enc = []
+            keep_ids = []
+            removed = 0
+            for enc, pid in zip(self._db["encodings"], self._db["person_ids"]):
+                if pid == person_id:
+                    removed += 1
+                else:
+                    keep_enc.append(enc)
+                    keep_ids.append(pid)
+            self._db["encodings"] = keep_enc
+            self._db["person_ids"] = keep_ids
+            self._db["last_seen"].pop(person_id, None)
+        if removed:
+            self.save()
+            logger.info(f"Removed {removed} encodings for {person_id!r}")
+        return removed
+
     @property
-    def known_names(self) -> set:
-        return set(self._db["names"])
+    def known_person_ids(self) -> set:
+        return set(self._db["person_ids"])
 
     @property
     def encoding_count(self) -> int:
@@ -268,10 +307,10 @@ class FaceDatabase:
     def last_seen_map(self) -> dict:
         return dict(self._db["last_seen"])
 
-    def _save_face_image(self, name, frame, bbox):
+    def _save_face_image(self, person_id, frame, bbox):
         top, right, bottom, left = bbox
         face_img = frame[top:bottom, left:right]
-        person_dir = os.path.join(self.db_dir, name)
+        person_dir = os.path.join(self.db_dir, person_id)
         os.makedirs(person_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         cv2.imwrite(os.path.join(person_dir, f"{timestamp}.jpg"), face_img)
@@ -408,31 +447,28 @@ class FaceTracker:
                 bbox, enc = detections[det_idx]
                 track = self._tracks[track_idx]
                 was_occluded = not track.is_visible
-                old_name = (self._identities.get(track.track_id) or Identity("", 0)).name or None
+                prev_ident = self._identities.get(track.track_id)
+                old_pid = prev_ident.person_id if prev_ident else None
                 old_emotion = track.emotion
 
                 self._update_track(track, enc, bbox, frame)
 
                 # Recovery event
                 if was_occluded:
-                    name = self.get_name(track.track_id)
+                    pid = self.get_person_id(track.track_id)
                     pending.append(self._make_event(
                         FaceEventType.FACE_RECOVERED, track.track_id,
                         FaceRecoveredPayload(
-                            bbox=bbox, name=name,
+                            bbox=bbox, person_id=pid,
                             seconds_missing=now - track.last_seen + (now - track.last_seen),
                         )
                     ))
-                    # Fix: seconds_missing should be time since last seen before this update
-                    # We already updated last_seen in _update_track, so use the gap
-                    # Actually, _update_track sets last_seen=now, and before it was the old value
-                    # We need to capture it before. Let me adjust below.
 
                 # Identity change
                 new_ident = self._identities.get(track.track_id)
-                new_name = new_ident.name if new_ident else None
-                if old_name != new_name:
-                    identity_changes.append((track.track_id, old_name, new_name,
+                new_pid = new_ident.person_id if new_ident else None
+                if old_pid != new_pid:
+                    identity_changes.append((track.track_id, old_pid, new_pid,
                                              new_ident.confidence if new_ident else 0.0))
 
                 # Emotion change (with debounce)
@@ -441,12 +477,12 @@ class FaceTracker:
                     if stable is None or stable[0] != track.emotion:
                         self._emotion_stable[track.track_id] = (track.emotion, now)
                     elif now - stable[1] >= self._emotion_debounce_s:
-                        name = self.get_name(track.track_id)
+                        pid = self.get_person_id(track.track_id)
                         pending.append(self._make_event(
                             FaceEventType.EMOTION_CHANGED, track.track_id,
                             EmotionChangedPayload(
                                 old_emotion=old_emotion, new_emotion=track.emotion,
-                                new_confidence=track.emotion_confidence, name=name,
+                                new_confidence=track.emotion_confidence, person_id=pid,
                             )
                         ))
 
@@ -456,10 +492,10 @@ class FaceTracker:
                 was_visible = track.is_visible
                 track.frames_since_seen += 1
                 if was_visible:
-                    name = self.get_name(track.track_id)
+                    pid = self.get_person_id(track.track_id)
                     pending.append(self._make_event(
                         FaceEventType.FACE_OCCLUDED, track.track_id,
-                        FaceOccludedPayload(last_bbox=track.bbox, name=name)
+                        FaceOccludedPayload(last_bbox=track.bbox, person_id=pid)
                     ))
 
             # --- Evict lost tracks ---
@@ -476,7 +512,7 @@ class FaceTracker:
                     FaceEventType.FACE_DISAPPEARED, track.track_id,
                     FaceDisappearedPayload(
                         last_bbox=track.bbox,
-                        name=ident.name if ident else None,
+                        person_id=ident.person_id if ident else None,
                         duration_visible=track.last_seen - track.first_seen,
                         total_frames=track.frames_visible,
                     )
@@ -496,31 +532,32 @@ class FaceTracker:
                     FaceAppearedPayload(
                         bbox=bbox, emotion=track.emotion,
                         emotion_confidence=track.emotion_confidence,
-                        initial_name=ident.name if ident else None,
+                        initial_person_id=ident.person_id if ident else None,
                         initial_confidence=ident.confidence if ident else 0.0,
                     )
                 ))
 
             # --- Identity change events ---
-            for track_id, old_name, new_name, new_conf in identity_changes:
-                if old_name is None and new_name:
+            for track_id, old_pid, new_pid, new_conf in identity_changes:
+                if old_pid is None and new_pid:
                     pending.append(self._make_event(
                         FaceEventType.IDENTITY_CONFIRMED, track_id,
                         IdentityConfirmedPayload(
-                            name=new_name, confidence=new_conf,
-                            last_seen_timestamp=self.db.get_last_seen(new_name),
+                            person_id=new_pid, confidence=new_conf,
+                            last_seen_timestamp=self.db.get_last_seen(new_pid),
                         )
                     ))
-                elif old_name and new_name is None:
+                elif old_pid and new_pid is None:
                     pending.append(self._make_event(
                         FaceEventType.IDENTITY_LOST, track_id,
-                        IdentityLostPayload(previous_name=old_name)
+                        IdentityLostPayload(previous_person_id=old_pid)
                     ))
-                elif old_name and new_name and old_name != new_name:
+                elif old_pid and new_pid and old_pid != new_pid:
                     pending.append(self._make_event(
                         FaceEventType.IDENTITY_CHANGED, track_id,
                         IdentityChangedPayload(
-                            old_name=old_name, new_name=new_name, new_confidence=new_conf,
+                            old_person_id=old_pid, new_person_id=new_pid,
+                            new_confidence=new_conf,
                         )
                     ))
 
@@ -542,9 +579,9 @@ class FaceTracker:
         with self._lock:
             return self._identities.get(track_id)
 
-    def get_name(self, track_id: int) -> Optional[str]:
+    def get_person_id(self, track_id: int) -> Optional[str]:
         ident = self._identities.get(track_id)
-        return ident.name if ident else None
+        return ident.person_id if ident else None
 
     def get_confidence(self, track_id: int) -> float:
         ident = self._identities.get(track_id)
@@ -572,27 +609,27 @@ class FaceTracker:
         visible = self.get_visible_faces()
         return max(visible, key=lambda f: f.focus_score) if visible else None
 
-    def get_recognized_names(self) -> list[str]:
+    def get_recognized_person_ids(self) -> list[str]:
         result = []
         for f in self.get_visible_faces():
-            name = self.get_name(f.track_id)
-            if name:
-                result.append(name)
+            pid = self.get_person_id(f.track_id)
+            if pid:
+                result.append(pid)
         return result
 
-    def learn_face(self, track_id: int, name: str, frame: np.ndarray) -> bool:
+    def learn_face(self, track_id: int, person_id: str, frame: np.ndarray) -> bool:
         face = self.get_face_by_id(track_id)
         if face is None:
             return False
-        self.db.add_face(name, face.encoding, frame, face.bbox)
+        self.db.add_face(person_id, face.encoding, frame, face.bbox)
         with self._lock:
             self._identities[track_id] = Identity(
-                name=name, confidence=100.0,
+                person_id=person_id, confidence=100.0,
                 _matching_since=0.0, _confirmed=True,
             )
         self._dispatcher.dispatch(self._make_event(
             FaceEventType.FACE_LEARNED, track_id,
-            FaceLearnedPayload(name=name)
+            FaceLearnedPayload(person_id=person_id)
         ))
         return True
 
@@ -623,7 +660,7 @@ class FaceTracker:
                     FaceEventType.FOCUS_CHANGED, None,
                     FocusChangedPayload(
                         old_track_id=self._focus_id, new_track_id=0,
-                        old_focus_score=0, new_focus_score=0, new_name=None,
+                        old_focus_score=0, new_focus_score=0, new_person_id=None,
                     )
                 ))
             self._focus_id = None
@@ -660,7 +697,7 @@ class FaceTracker:
                     FocusChangedPayload(
                         old_track_id=old_id, new_track_id=best.track_id,
                         old_focus_score=0, new_focus_score=best.focus_score,
-                        new_name=self.get_name(best.track_id),
+                        new_person_id=self.get_person_id(best.track_id),
                     )
                 ))
             return events
@@ -689,7 +726,7 @@ class FaceTracker:
                             old_track_id=old_id, new_track_id=best.track_id,
                             old_focus_score=current_score,
                             new_focus_score=best.focus_score,
-                            new_name=self.get_name(best.track_id),
+                            new_person_id=self.get_person_id(best.track_id),
                         )
                     ))
             else:
@@ -802,38 +839,38 @@ class FaceTracker:
             except Exception:
                 pass
 
-        name, confidence = self.db.recognize(encoding)
-        if name is not None:
+        person_id, confidence = self.db.recognize(encoding)
+        if person_id is not None:
             self._identities[track.track_id] = Identity(
-                name=name, confidence=confidence,
-                _matching_since=now, _candidate_name=name,
+                person_id=person_id, confidence=confidence,
+                _matching_since=now, _candidate_person_id=person_id,
                 _candidate_confidence=confidence,
             )
 
         return track
 
     def _recognize_and_stabilize(self, track):
-        raw_name, raw_conf = self.db.recognize(track.encoding)
+        raw_pid, raw_conf = self.db.recognize(track.encoding)
         tid = track.track_id
         now = time.time()
         ident = self._identities.get(tid)
 
-        if raw_name is not None:
+        if raw_pid is not None:
             if ident is None:
                 ident = Identity(
-                    name=raw_name, confidence=raw_conf,
-                    _matching_since=now, _candidate_name=raw_name,
+                    person_id=raw_pid, confidence=raw_conf,
+                    _matching_since=now, _candidate_person_id=raw_pid,
                     _candidate_confidence=raw_conf,
                 )
                 self._identities[tid] = ident
             else:
-                if raw_name != ident._candidate_name:
-                    ident._candidate_name = raw_name
+                if raw_pid != ident._candidate_person_id:
+                    ident._candidate_person_id = raw_pid
                     ident._candidate_confidence = raw_conf
                     ident._matching_since = now
                 ident._failing_since = 0.0
                 if now - ident._matching_since >= self._confirm_s:
-                    ident.name = raw_name
+                    ident.person_id = raw_pid
                     ident.confidence = raw_conf
                     ident._confirmed = True
         else:
@@ -981,13 +1018,13 @@ def main():
         p = event.payload
         # Build a short summary
         if event.type == FaceEventType.FACE_APPEARED:
-            msg = f"track={event.track_id} name={p.initial_name or '?'} emo={p.emotion}"
+            msg = f"track={event.track_id} id={p.initial_person_id or '?'} emo={p.emotion}"
         elif event.type == FaceEventType.FACE_DISAPPEARED:
-            msg = f"track={event.track_id} name={p.name or '?'} dur={p.duration_visible:.1f}s"
+            msg = f"track={event.track_id} id={p.person_id or '?'} dur={p.duration_visible:.1f}s"
         elif event.type == FaceEventType.FOCUS_CHANGED:
-            msg = f"{p.old_track_id} -> {p.new_track_id} ({p.new_name or '?'})"
+            msg = f"{p.old_track_id} -> {p.new_track_id} ({p.new_person_id or '?'})"
         elif event.type == FaceEventType.IDENTITY_CONFIRMED:
-            msg = f"track={event.track_id} -> {p.name} ({p.confidence:.0f}%)"
+            msg = f"track={event.track_id} -> {p.person_id} ({p.confidence:.0f}%)"
         elif event.type == FaceEventType.EMOTION_CHANGED:
             msg = f"track={event.track_id} {p.old_emotion}->{p.new_emotion}"
         else:
@@ -1063,17 +1100,17 @@ def main():
             for i in range(0, bottom - top, 12):
                 cv2.line(frame, (left, top + i), (left, top + min(i + 6, bottom - top)), ghost_color, 2)
                 cv2.line(frame, (right, top + i), (right, top + min(i + 6, bottom - top)), ghost_color, 2)
-            name = tracker.get_name(focus_face.track_id)
+            pid = tracker.get_person_id(focus_face.track_id)
             ghost_label = f"FOCUS (lost {elapsed:.1f}s)"
-            if name:
-                ghost_label = f"{name} - {ghost_label}"
+            if pid:
+                ghost_label = f"{pid} - {ghost_label}"
             cv2.putText(frame, ghost_label, (left, top - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, ghost_color, 1)
 
         for rank, face in enumerate(visible):
             is_focus = (face.track_id == focus_id)
             is_selected = (face.track_id == selected_track_id)
-            name = tracker.get_name(face.track_id)
+            pid = tracker.get_person_id(face.track_id)
             conf = tracker.get_confidence(face.track_id)
             top, right, bottom, left = face.bbox
 
@@ -1085,7 +1122,7 @@ def main():
                 cv2.rectangle(glow, (left - pad, top - pad), (right + pad, bottom + pad),
                               (0, 255, 100), cv2.FILLED)
                 cv2.addWeighted(glow, 0.15, frame, 0.85, 0, frame)
-            elif name:
+            elif pid:
                 color = (0, 200, 0)
                 thickness = 2
             else:
@@ -1103,8 +1140,8 @@ def main():
                 cv2.rectangle(frame, (left - 2, top - 2), (right + 2, bottom + 2),
                               (0, 255, 255), 1)
 
-            if name:
-                label = f"[{rank+1}] #{face.track_id} {name} {conf:.0f}%"
+            if pid:
+                label = f"[{rank+1}] #{face.track_id} {pid} {conf:.0f}%"
             else:
                 label = f"[{rank+1}] #{face.track_id} Unknown"
             cv2.rectangle(frame, (left, bottom), (right, bottom + 30), color, cv2.FILLED)
@@ -1127,7 +1164,7 @@ def main():
             cv2.putText(frame, info, (left + 6, bottom + 48),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
 
-        status = f"Tracks: {len(visible)} | Known: {len(face_db.known_names)} | DB: {face_db.encoding_count} encodings"
+        status = f"Tracks: {len(visible)} | Known: {len(face_db.known_person_ids)} | DB: {face_db.encoding_count} encodings"
         cv2.putText(frame, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.putText(frame, "L=learn  TAB=select  D=delete-db  Q=quit",
                     (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
@@ -1153,11 +1190,11 @@ def main():
                 if face:
                     existing = None
                     if tracker.is_recognized(face.track_id):
-                        existing = (tracker.get_name(face.track_id),
+                        existing = (tracker.get_person_id(face.track_id),
                                     tracker.get_confidence(face.track_id))
-                    input_name = _get_name_from_gui(frame, existing)
-                    if input_name:
-                        tracker.learn_face(selected_track_id, input_name, frame)
+                    input_label = _get_name_from_gui(frame, existing)
+                    if input_label:
+                        tracker.learn_face(selected_track_id, input_label, frame)
         elif key == ord("d"):
             display = frame.copy()
             cv2.putText(display, "DELETE ALL FACES? Y/N", (50, frame.shape[0] // 2),

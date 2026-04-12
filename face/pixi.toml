@@ -24,11 +24,13 @@ torch = "*"
 torchaudio = "*"
 noisereduce = "*"
 pydantic-ai = {version = "*", extras = ["openai", "mcp"]}
+livekit = ">=1.1.5, <2"
 
 [tasks]
 run = "python main.py"
 vision = "python face_tracker.py"
 listen = "python voice_input.py"
 people = "python people_memory.py"
+shell = "python people_memory.py shell"
 speak = "python voice_output.py"
 agent = "python agent.py"

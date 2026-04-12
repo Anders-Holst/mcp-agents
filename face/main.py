@@ -261,14 +261,47 @@ def get_name_from_gui(frame, existing_match=None):
             name += chr(key)
 
 
-def draw_faces(frame, tracker):
-    """Draw face boxes, names, emotions, and focus indicator."""
+def draw_faces(frame, tracker, memory):
+    """Draw face boxes, names, emotions, and focus indicator.
+
+    Display names are resolved via ``memory`` (the tracker only knows
+    stable person IDs). Also draws a fading ghost box for the focused
+    face if it briefly disappears (grace period before track is evicted).
+    """
     faces = tracker.get_visible_faces()
     focus_id = tracker.focus_track_id
 
+    # Ghost box for the focused face if it's in the grace period
+    if focus_id is not None:
+        focus_face = tracker.get_face_by_id(focus_id)
+        if focus_face and not focus_face.is_visible:
+            elapsed = time.time() - focus_face.last_seen
+            alpha = max(0.0, 1.0 - elapsed / 2.0)
+            ghost_color = (0, int(255 * alpha), int(100 * alpha))
+            top, right, bottom, left = focus_face.bbox
+            # Dashed border
+            for i in range(0, right - left, 12):
+                cv2.line(frame, (left + i, top),
+                         (left + min(i + 6, right - left), top), ghost_color, 2)
+                cv2.line(frame, (left + i, bottom),
+                         (left + min(i + 6, right - left), bottom), ghost_color, 2)
+            for i in range(0, bottom - top, 12):
+                cv2.line(frame, (left, top + i),
+                         (left, top + min(i + 6, bottom - top)), ghost_color, 2)
+                cv2.line(frame, (right, top + i),
+                         (right, top + min(i + 6, bottom - top)), ghost_color, 2)
+            person = memory.get(focus_face.track_id)
+            name = person.name if person and person.is_identified else None
+            ghost_label = f"FOCUS (lost {elapsed:.1f}s)"
+            if name:
+                ghost_label = f"{name} - {ghost_label}"
+            cv2.putText(frame, ghost_label, (left, top - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, ghost_color, 1)
+
     for rank, face in enumerate(faces):
         is_focus = (face.track_id == focus_id)
-        name = tracker.get_name(face.track_id)
+        person = memory.get(face.track_id)
+        name = person.name if person and person.is_identified else None
         conf = tracker.get_confidence(face.track_id)
         top, right, bottom, left = face.bbox
         color = (0, 255, 100) if is_focus else (0, 200, 0) if name else (0, 0, 200)
@@ -307,6 +340,9 @@ def main():
     parser.add_argument("--mcp-config", default=None)
     parser.add_argument("--mcp-server", action="append", default=[])
     parser.add_argument("--agent-name", default="Face Agent")
+    parser.add_argument("--smart-greeting", action="store_true",
+                        help="Use the LLM for greetings (slower, but can reference facts). "
+                             "Default is canned templates — instant.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -340,6 +376,7 @@ def main():
         mcp_servers=mcp_servers,
         mcp_descriptions=mcp_descriptions,
         agent_name=args.agent_name,
+        smart_greetings=args.smart_greeting,
     )
 
     agent = Agent(
@@ -354,23 +391,30 @@ def main():
 
     # --- Event log (bridge agent events to on-screen log) ---
     event_log = EventLog()
-    event_log.add("system", f"App started, {len(face_db.known_names)} known people")
+    event_log.add("system", f"App started, {len(face_db.known_person_ids)} known people")
     event_log.add("system", f"Log file: {LOG_FILE}")
+
+    def _resolve_name(person_id):
+        if not person_id:
+            return None
+        person = memory.get_by_id(person_id)
+        return person.name if person else person_id
 
     # Bridge face tracker events to the event log
     from face_tracker import FaceEvent, FaceEventType
     def on_face_event(event: FaceEvent):
         p = event.payload
         if event.type == FaceEventType.FACE_APPEARED:
-            name = getattr(p, 'initial_name', None) or '?'
+            name = _resolve_name(getattr(p, 'initial_person_id', None)) or '?'
             event_log.add("face", f"Appeared: {name} (track {event.track_id})")
         elif event.type == FaceEventType.FACE_DISAPPEARED:
-            name = getattr(p, 'name', None) or '?'
+            name = _resolve_name(getattr(p, 'person_id', None)) or '?'
             event_log.add("face", f"Left: {name} (track {event.track_id})")
         elif event.type == FaceEventType.IDENTITY_CONFIRMED:
-            event_log.add("face", f"Identified: {p.name} (track {event.track_id})")
+            name = _resolve_name(p.person_id) or p.person_id
+            event_log.add("face", f"Identified: {name} (track {event.track_id})")
         elif event.type == FaceEventType.EMOTION_CHANGED:
-            name = getattr(p, 'name', None) or f"track {event.track_id}"
+            name = _resolve_name(getattr(p, 'person_id', None)) or f"track {event.track_id}"
             event_log.add("emotion", f"{name}: {p.old_emotion} -> {p.new_emotion}")
     tracker.subscribe(on_face_event)
 
@@ -441,13 +485,13 @@ def main():
             agent.check_unknown_faces(frame)
 
             # --- Draw ---
-            draw_faces(frame, tracker)
+            draw_faces(frame, tracker, memory)
             draw_audio_meter(frame, audio_monitor, voice_in)
             draw_event_log_window(event_log)
 
             # Status bar
             visible = tracker.get_visible_faces()
-            status = f"Faces: {len(visible)} | Known: {len(face_db.known_names)} | People: {memory.active_count}"
+            status = f"Faces: {len(visible)} | Known: {len(face_db.known_person_ids)} | People: {memory.active_count}"
             if agent.busy:
                 status += " | BUSY"
             if agent.auto_ask:
@@ -473,12 +517,14 @@ def main():
                 if primary:
                     existing = None
                     if tracker.is_recognized(primary.track_id):
-                        existing = (tracker.get_name(primary.track_id),
-                                    tracker.get_confidence(primary.track_id))
+                        active = memory.get(primary.track_id)
+                        existing_name = active.name if active else tracker.get_person_id(primary.track_id)
+                        existing = (existing_name, tracker.get_confidence(primary.track_id))
                     name = get_name_from_gui(frame, existing)
                     if name:
-                        tracker.learn_face(primary.track_id, name, frame)
-                        event_log.add("face", f"Manually learned: {name}")
+                        person_id = memory.create_person(primary.track_id, name)
+                        tracker.learn_face(primary.track_id, person_id, frame)
+                        event_log.add("face", f"Manually learned: {name} ({person_id})")
 
             elif key == ord("t"):
                 # Talk: manual one-shot listen + respond
@@ -517,7 +563,7 @@ def main():
                 confirm = cv2.waitKey(0) & 0xFF
                 if confirm == ord("y"):
                     event_log.add("action", "Database cleared",
-                                  f"was {len(face_db.known_names)} people")
+                                  f"was {len(face_db.known_person_ids)} people")
                     face_db.clear()
 
     except KeyboardInterrupt:

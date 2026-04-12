@@ -216,6 +216,225 @@ class AudioMonitor:
 
 
 # ---------------------------------------------------------------------------
+# EchoDetector — lightweight mic monitor for barge-in during TTS
+# ---------------------------------------------------------------------------
+
+class EchoDetector:
+    """WebRTC AEC-based barge-in detector for TTS playback.
+
+    Uses a full-duplex ``sd.Stream`` to play TTS and record mic
+    simultaneously. The TTS render reference is fed to
+    ``livekit.rtc.AudioProcessingModule`` (WebRTC AEC3 + noise
+    suppression) which subtracts the echo. The residual signal is
+    the user's voice (if any). When the residual RMS exceeds a
+    threshold, ``user_speaking`` goes True.
+
+    Architecture::
+
+        TTS audio ──► speakers (via sd.Stream output)
+            │
+            └──► APM.process_reverse_stream()  (render reference)
+                                │
+        mic ──► APM.process_stream() ──► clean audio ──► RMS check
+    """
+
+    def __init__(self,
+                 stream_rate: int = SAMPLE_RATE,
+                 speech_threshold: float = 0.08,
+                 min_duration_ms: int = 200):
+        self._stream_rate = stream_rate
+        self._speech_threshold = speech_threshold
+        self._min_chunks = max(1, min_duration_ms // 10)  # 10ms frames
+        self._stream: Optional[sd.Stream] = None
+        self._output_buffer: list[np.ndarray] = []
+        self._output_finished = False
+        self._stop_event = threading.Event()
+        self._above_count: int = 0
+
+        # Observable state
+        self.user_speaking: bool = False
+        self.current_rms: float = 0.0       # raw mic RMS
+        self.clean_rms: float = 0.0         # RMS after echo cancellation
+        self.output_rms: float = 0.0        # TTS output RMS
+        self.playing: bool = False
+
+        # Waveform buffers for oscilloscope display (last ~100ms)
+        self._wave_len = 1600  # 100ms at 16kHz
+        self.wave_output: np.ndarray = np.zeros(self._wave_len, dtype=np.float32)
+        self.wave_raw: np.ndarray = np.zeros(self._wave_len, dtype=np.float32)
+        self.wave_clean: np.ndarray = np.zeros(self._wave_len, dtype=np.float32)
+
+        # For display/logging compatibility with agent's _draw_echo_state
+        self._baseline: float = 0.0
+        self._factor: float = speech_threshold
+        self._calibrated: bool = True
+
+    def feed(self, audio_chunk: np.ndarray):
+        """Feed a TTS audio chunk for playback."""
+        self._output_buffer.append(audio_chunk)
+
+    def finish_feeding(self):
+        """Signal that all TTS audio has been fed."""
+        self._output_finished = True
+
+    def start(self, tts_sample_rate: int = 22050):
+        """Start the full-duplex stream with WebRTC AEC."""
+        from livekit.rtc import AudioProcessingModule, AudioFrame
+
+        self.user_speaking = False
+        self._above_count = 0
+        self._stop_event.clear()
+        self._output_finished = False
+        self.playing = True
+
+        apm = AudioProcessingModule(
+            echo_cancellation=True,
+            noise_suppression=False,  # off — was suppressing user voice too
+            high_pass_filter=True,
+            auto_gain_control=False,
+        )
+        # Tell the AEC the approximate speaker→mic delay so it can
+        # properly separate echo from user voice during double-talk.
+        # ~50ms is typical for laptop speakers→mic on macOS.
+        apm.set_stream_delay_ms(50)
+
+        sr = self._stream_rate
+        # WebRTC APM requires exactly 10ms frames
+        frame_samples = sr // 100  # 160 samples at 16kHz
+
+        def callback(indata, outdata, frames, time_info, status):
+            if self._stop_event.is_set():
+                outdata[:, 0] = 0
+                raise sd.CallbackStop
+
+            # --- Output: play from buffer ---
+            if self._output_buffer:
+                chunk = self._output_buffer[0]
+                if len(chunk) <= frames:
+                    outdata[:len(chunk), 0] = chunk
+                    outdata[len(chunk):, 0] = 0
+                    self._output_buffer.pop(0)
+                else:
+                    outdata[:, 0] = chunk[:frames]
+                    self._output_buffer[0] = chunk[frames:]
+            else:
+                outdata[:, 0] = 0
+                if self._output_finished:
+                    raise sd.CallbackStop
+
+            # --- Process in 10ms frames through WebRTC APM ---
+            inp = indata[:, 0]
+            out = outdata[:, 0]
+            self.current_rms = float(np.sqrt(np.mean(inp ** 2)))
+            self.output_rms = float(np.sqrt(np.mean(out ** 2)))
+            self._baseline = self.output_rms
+
+            # Update waveform ring buffers
+            n = len(inp)
+            wl = self._wave_len
+            self.wave_output = np.roll(self.wave_output, -n)
+            self.wave_output[-n:] = out[:n]
+            self.wave_raw = np.roll(self.wave_raw, -n)
+            self.wave_raw[-n:] = inp[:n]
+
+            all_clean = []
+            max_clean_rms = 0.0
+            for i in range(0, min(len(inp), len(out)), frame_samples):
+                end = i + frame_samples
+                if end > len(inp) or end > len(out):
+                    break
+
+                # Convert float32 [-1,1] to int16 for APM
+                out_i16 = (out[i:end] * 32767).astype(np.int16)
+                inp_i16 = (inp[i:end] * 32767).astype(np.int16)
+
+                # Feed render reference (what the speakers are playing)
+                ref_frame = AudioFrame(
+                    out_i16.tobytes(), sample_rate=sr,
+                    num_channels=1, samples_per_channel=frame_samples)
+                apm.process_reverse_stream(ref_frame)
+
+                # Process mic input (echo cancellation happens in-place)
+                mic_frame = AudioFrame(
+                    bytearray(inp_i16.tobytes()), sample_rate=sr,
+                    num_channels=1, samples_per_channel=frame_samples)
+                apm.process_stream(mic_frame)
+
+                # Check residual for user speech
+                clean_i16 = np.frombuffer(mic_frame.data, dtype=np.int16)
+                clean_f32 = clean_i16.astype(np.float32) / 32767.0
+                all_clean.append(clean_f32)
+                frame_rms = float(np.sqrt(np.mean(clean_f32 ** 2)))
+                max_clean_rms = max(max_clean_rms, frame_rms)
+
+                # Per-frame barge-in check (10ms resolution)
+                if frame_rms > self._speech_threshold:
+                    self._above_count += 1
+                    if self._above_count >= self._min_chunks and not self.user_speaking:
+                        self.user_speaking = True
+                        logger.info(
+                            f"[AEC] barge-in: clean_rms={frame_rms:.4f} "
+                            f"threshold={self._speech_threshold}")
+                else:
+                    self._above_count = max(0, self._above_count - 1)
+
+            self.clean_rms = max_clean_rms
+            if all_clean:
+                clean_all = np.concatenate(all_clean)
+                nc = len(clean_all)
+                self.wave_clean = np.roll(self.wave_clean, -nc)
+                self.wave_clean[-nc:] = clean_all[:nc]
+
+        self._stream = sd.Stream(
+            samplerate=sr, channels=1, dtype='float32',
+            blocksize=frame_samples * 10,  # 100ms blocks (10 APM frames)
+            callback=callback,
+        )
+        self._stream.start()
+        logger.info(f"[AEC] started full-duplex stream at {sr}Hz, "
+                    f"threshold={self._speech_threshold}")
+
+    def stop(self, beep: bool = False):
+        """Stop playback and close the stream.
+
+        If ``beep`` is True, plays a short confirmation tone (~100ms)
+        through the default output device after stopping, so the user
+        gets audible feedback that their barge-in was detected.
+        """
+        self._stop_event.set()
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        self.playing = False
+        if beep:
+            self._play_beep()
+
+    @staticmethod
+    def _play_beep(freq: float = 880, duration_ms: int = 80,
+                   volume: float = 0.3, sample_rate: int = SAMPLE_RATE):
+        """Play a short confirmation beep."""
+        try:
+            t = np.linspace(0, duration_ms / 1000, int(sample_rate * duration_ms / 1000),
+                            dtype=np.float32)
+            # Sine with quick fade-in/out to avoid click
+            tone = np.sin(2 * np.pi * freq * t) * volume
+            fade = min(len(tone) // 4, 50)
+            tone[:fade] *= np.linspace(0, 1, fade)
+            tone[-fade:] *= np.linspace(1, 0, fade)
+            sd.play(tone, samplerate=sample_rate, blocking=True)
+        except Exception:
+            pass
+
+    @property
+    def active(self) -> bool:
+        return self._stream is not None and self._stream.active
+
+
+# ---------------------------------------------------------------------------
 # VoiceInput
 # ---------------------------------------------------------------------------
 
@@ -254,6 +473,7 @@ class VoiceInput:
         # Observable state (for GUI polling)
         self.vad_prob: float = 0.0
         self.listen_phase: str = ""  # "", "waiting", "recording", "transcribing"
+        self._cancel_listen: bool = False
         self.detected_language: str = ""
         self.detected_language_prob: float = 0.0
 
@@ -356,6 +576,7 @@ class VoiceInput:
         self._ensure_vad()
         self.listen_phase = "waiting"
         self.vad_prob = 0.0
+        self._cancel_listen = False
 
         vad_model = self._vad_model
         vad_model.reset_states()
@@ -382,6 +603,10 @@ class VoiceInput:
 
         try:
             while True:
+                if self._cancel_listen:
+                    logger.info("[VAD] listen cancelled")
+                    return None
+
                 data, _ = stream.read(chunk_samples)
                 chunk = data[:, 0]
                 total_chunks += 1
@@ -562,7 +787,11 @@ class ContinuousListener:
 
     def stop(self):
         self._running = False
+        self.voice._cancel_listen = True
         self.voice._emit(VoiceEventType.CONTINUOUS_STOPPED, ContinuousStatePayload())
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
 
     @property
     def paused(self):

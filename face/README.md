@@ -8,44 +8,76 @@ can give it extra capabilities like controlling smart home devices.
 ## Architecture
 
 ```
- Camera frames              Microphone audio
-      |                          |
-      v                          v
- +--------------+        +-------------+
- | face_tracker |        | voice_input |
- |  detection   |        |  VAD        |
- |  recognition |        |  Whisper    |
- |  emotion     |        |  transcribe |
- |  tracking    |        +------+------+
- +------+-------+               |
-        |                       |
-        |  FaceEvents           |  speech text
-        v                       v
- +------+-----------------------+------+
- |              agent                  |
- |                                     |
- |  _on_face_event    _on_heard_speech |
- |       |                  |          |
- |       v                  v          |
- |   [decide]           [respond]      |
- |       |                  |          |
- |       v                  v          |
- |     llm  (Ollama + MCP tools)       |
- |       |                             |
- |       v                             |
- |  voice_output  (piper TTS)          |
- +-------------------------------------+
-        |
-        v
- +--------------+     +----------------+
- | people_memory|     | mcp_client     |
- | per-person   |     | MCP server     |
- | dialogues,   |     | config/loader  |
- | facts, prefs |     +----------------+
- +--------------+
+ Camera frames              Microphone audio          Speakers
+      |                          |                       ^
+      v                          v                       |
+ +--------------+        +-------------+          +-------------+
+ | face_tracker |        | voice_input |          | voice_output|
+ |  detection   |        |  VAD        |          |  piper TTS  |
+ |  recognition |        |  Whisper    |          +------+------+
+ |  emotion     |        |  transcribe |                 |
+ |  tracking    |        +------+------+                 |
+ +------+-------+               |                       |
+        |                       |         +------+-------+------+
+        |  FaceEvents           |         | WebRTC AEC (livekit)|
+        v                       v         | echo cancellation   |
+ +------+-----------------------+---------+ barge-in detection  |
+ |                    agent                                     |
+ |                                                              |
+ |  _on_face_event    _on_heard_speech     speak() w/ AEC      |
+ |       |                  |                    |              |
+ |       v                  v                    v              |
+ |   [decide]           [respond]          [play + monitor]    |
+ |       |                  |                                   |
+ |       v                  v                                   |
+ |     llm  (Ollama)  +  write_fact / set_name tools           |
+ +---------------------------+----------------------------------+
+                             |
+              +--------------+--------------+
+              |                             |
+       +--------------+             +----------------+
+       | people_memory|             | mcp_client     |
+       | per-person   |             | MCP server     |
+       | facts,       |             | config/loader  |
+       | dialogues    |             +----------------+
+       +--------------+
 
 All modules use events.py for publish/subscribe communication.
 ```
+
+## Key design decisions
+
+### Stable person IDs
+
+People are identified by a stable `person_id` (e.g. `p001`) that never changes,
+even on rename. The face database (`known_faces/faces.pkl`) stores person IDs,
+not names. Display names live in `people/{person_id}.json` and are the single
+source of truth.
+
+### Single facts storage
+
+All personal information lives in `person.facts` (a flat list of strings).
+No separate preferences or slots. A background tool-calling agent runs
+`write_fact`, `replace_fact`, and `set_name` after each conversation turn.
+Facts support replacement (e.g. "Favourite food is sushi" replaces
+"Favourite food is chokladbullar").
+
+### Canned greetings by default
+
+Greetings use random templates ("Hi Joakim!") with no LLM call -- instant.
+Pass `--smart-greeting` to enable LLM-generated greetings that reference facts.
+
+### LLM-based name extraction
+
+When an unknown person speaks, the LLM extracts their name (not a regex).
+Handles multilingual input, messy transcription, and proper capitalization.
+
+### WebRTC echo cancellation
+
+`agent.speak()` uses a full-duplex `sd.Stream` with the livekit
+`AudioProcessingModule` (WebRTC AEC3). The TTS render reference is fed to
+the AEC, which subtracts the echo from the mic signal. The residual is
+monitored for barge-in -- if a human speaks over the agent, TTS is interrupted.
 
 ## Agent decision logic
 
@@ -53,53 +85,59 @@ The agent is event-driven. Two inputs trigger decisions:
 
 ### Face events (from face_tracker)
 
-```
-_on_face_event(event)
-  |
-  |-- FACE_DISAPPEARED (known person)?
-  |     -> say "Goodbye, <name>!"           (always, even when busy)
-  |
-  |-- busy?
-  |     -> drop event                       (one interaction at a time)
-  |
-  |-- IDENTITY_CONFIRMED (recognized face)?
-  |     -> greet if auto_greet and cooldown expired
-  |
-  |-- FACE_APPEARED (new track)?
-  |     -> if known: greet (same cooldown logic)
-  |     -> if unknown: tracked, later check_unknown_faces() asks their name
-```
+- **FACE_DISAPPEARED** (known person) -- say goodbye (skipped if TTS is busy)
+- **IDENTITY_CONFIRMED** (recognized face) -- greet if cooldown expired
+- **FACE_APPEARED** (new track) -- if known: greet; if unknown: ask name later
 
-### Speech events (from voice_input via ContinuousListener)
+### Speech events (from ContinuousListener)
 
-```
-_on_heard_speech(text)
-  |
-  |-- find who is in focus (primary face)
-  |-- log dialogue to people_memory
-  |-- LLM generates response (with person context + MCP tools)
-  |-- speak response
-```
+1. Find who is in focus (primary face)
+2. If unidentified, try to learn their name via LLM
+3. Generate response (fast path, `reasoning_effort: none`)
+4. Speak response (with AEC + barge-in monitoring)
+5. Background: extract facts via tool calling
 
 ### Busy gate
 
 The agent does one thing at a time. A `_busy` flag prevents overlapping
-interactions. Goodbye is the exception -- it runs even when busy since
-it's a quick speak with no LLM call.
+interactions. Goodbye is skipped if TTS is already active. A 90-second
+watchdog auto-clears the flag if something hangs.
+
+### State indicator
+
+The camera window shows a large color-coded badge (top-right):
+
+| State | Color | Meaning |
+|-------|-------|---------|
+| IDLE | gray | No one around |
+| LISTENING | green | Waiting for speech |
+| LISTENING... | bright green | VAD detected speech, recording |
+| TRANSCRIBING | orange | Whisper processing audio |
+| THINKING | deep orange | LLM generating response |
+| TALKING | blue | TTS playing (with AEC) |
+
+### Two-path LLM strategy
+
+Response generation uses `reasoning_effort: none` for speed (~0.3-1s).
+Background fact extraction uses tool calling without `reasoning_effort`
+(~5-13s, thinking enabled) because Ollama requires thinking for tool calls.
+The user never waits for fact extraction -- it runs in a daemon thread.
 
 ## Modules
 
-| File | Purpose | Run standalone |
-|------|---------|----------------|
-| `agent.py` | Decision logic: what to do when a face/voice event arrives | `pixi run agent` |
-| `llm.py` | System prompt, LLM calls, MCP toolset wiring | -- |
+| File | Purpose | Standalone |
+|------|---------|------------|
+| `agent.py` | Decision logic, AEC speak, main entry point | `pixi run agent` |
+| `llm.py` | LLM calls, canned greetings, tool agents, fact extraction | -- |
 | `face_tracker.py` | Detection, recognition, emotion, tracking, events | `pixi run vision` |
-| `voice_input.py` | Mic monitoring, VAD, Whisper transcription | `pixi run listen` |
-| `voice_output.py` | Piper TTS, speak text aloud | `pixi run speak` |
-| `people_memory.py` | Per-person storage (dialogues, facts, prefs) | `pixi run people` |
+| `voice_input.py` | Mic monitoring, VAD, Whisper, EchoDetector (AEC) | `pixi run listen` |
+| `voice_output.py` | Piper TTS with interruptible playback | `pixi run speak` |
+| `people_memory.py` | Per-person storage (facts, dialogues, asked_topics) | `pixi run people` |
 | `mcp_client.py` | Load MCP server configs for the LLM | -- |
 | `events.py` | Shared EventDispatcher (pub/sub used by all modules) | -- |
-| `main.py` | UI shell: camera display, overlays, keyboard controls | `pixi run run` |
+| `main.py` | UI: camera display, overlays, keyboard controls | `pixi run run` |
+| `debug_shell.py` | Interactive REPL for inspecting/editing memory and agent state | -- |
+| `test_echo.py` | Standalone AEC test tool (play TTS, show echo cancellation) | `pixi run python test_echo.py` |
 
 ## Quick start
 
@@ -107,18 +145,83 @@ it's a quick speak with no LLM call.
 # Install dependencies
 pixi install
 
-# Start Ollama with a model
-ollama pull qwen3:8b
+# Pull an Ollama model (gemma4:e2b recommended for speed + tool calling)
+ollama pull gemma4:e2b
 
 # Run the agent (camera + mic + speaker)
-pixi run agent
+pixi run python agent.py --llm-model gemma4:e2b --shell
 ```
+
+The `--shell` flag opens an interactive debug shell alongside the agent.
+Type `help` for commands, `status` for full agent/listener/TTS/AEC state.
+
+## CLI options
+
+```
+--llm-model NAME       Ollama model (default: qwen3:8b, recommended: gemma4:e2b)
+--ollama-url URL       Ollama API URL (default: http://localhost:11434/v1)
+--camera N             Camera index (default: 0)
+--fps N                Target frame rate (default: 15)
+--agent-name NAME      Name the agent uses for itself (default: Face Agent)
+--smart-greeting       Use LLM for greetings (slower, references facts)
+--no-auto-greet        Don't auto-greet known faces
+--no-auto-ask          Don't auto-ask unknown faces for their name
+--en-voice NAME        Piper TTS voice (default: en_US-lessac-medium)
+--db-dir DIR           Face database directory (default: known_faces)
+--people-dir DIR       People memory directory (default: people)
+--mcp-config PATH      MCP servers JSON config file
+--mcp-server URL       MCP server SSE URL (repeatable)
+--shell                Start interactive debug shell alongside agent
+```
+
+## Debug shell commands
+
+```
+# Memory
+list                       List all known people
+show <name>                Full JSON dump
+facts <name>               Facts + asked topics
+context <name>             LLM context block
+missing <name>             Interview topics not yet asked
+add-fact <name> <fact>     Add a fact
+rename <old> <new>         Change display name (ID stays same)
+delete <name>              Remove from memory + face DB
+reset-topics <name>        Re-ask interview questions
+
+# Agent (when running with --shell)
+status                     Full state dump (agent/listener/TTS/AEC/faces)
+tracks                     Visible face tracks
+focus                      Currently focused face
+greet <track_id>           Force a greeting
+ask <track_id>             Force asking for name
+speak <text>               Speak text via TTS
+pause / resume             Pause/resume speech listening
+```
+
+## Data layout
+
+```
+known_faces/
+  faces.pkl              Face encodings keyed by person_id (schema v2)
+  p001/                  Face images for person p001
+    20260410_143022.jpg
+  p002/
+    ...
+
+people/
+  p001.json              Person record (name, facts, dialogues, asked_topics)
+  p002.json
+  ...
+```
+
+Person IDs are stable (`p001`, `p002`, ...) and never change on rename.
+The `name` field inside the JSON is the display name.
 
 ## Adding MCP servers
 
-MCP servers give the LLM access to external tools (lights, search, calendar, etc.).
+MCP servers give the LLM access to external tools (lights, search, etc.).
 
-### Option A: Config file
+### Config file
 
 Create `mcp_servers.json`:
 
@@ -127,7 +230,7 @@ Create `mcp_servers.json`:
     "servers": [
         {
             "name": "lights",
-            "description": "Control smart home lights (on/off, brightness, color)",
+            "description": "Control smart home lights",
             "type": "sse",
             "url": "http://localhost:8000/sse"
         },
@@ -142,35 +245,25 @@ Create `mcp_servers.json`:
 }
 ```
 
-The agent picks up `mcp_servers.json` automatically. The `description` field
-is shown to the LLM so it can explain its own capabilities when asked.
-
-### Option B: CLI flags
+### CLI flags
 
 ```bash
-pixi run agent --mcp-server http://localhost:8000/sse
-pixi run agent --mcp-server http://localhost:8000/sse --mcp-server http://localhost:9000/sse
-pixi run agent --mcp-config path/to/config.json
+pixi run python agent.py --llm-model gemma4:e2b --mcp-server http://localhost:8000/sse
+pixi run python agent.py --llm-model gemma4:e2b --mcp-config path/to/config.json
 ```
 
-### Server types
+## Testing echo cancellation
 
-- **sse** -- connect to an already-running MCP server over HTTP
-- **stdio** -- launch an MCP server as a subprocess
+```bash
+# Default test (background noise only -- should NOT trigger barge-in)
+pixi run python test_echo.py "Hello, this is a test."
 
-## CLI options
+# Custom threshold
+pixi run python test_echo.py --threshold 0.05 "Hello Joakim!"
 
+# Interactive mode
+pixi run python test_echo.py --interactive
 ```
---camera N           Camera index (default: 0)
---fps N              Target frame rate (default: 15)
---llm-model NAME     Ollama model (default: qwen3:8b)
---ollama-url URL     Ollama API URL (default: http://localhost:11434/v1)
---agent-name NAME    Name the agent uses to describe itself (default: Face Agent)
---mcp-config PATH    MCP servers JSON config file
---mcp-server URL     MCP server SSE URL (repeatable)
---no-auto-greet      Don't auto-greet known faces
---no-auto-ask        Don't auto-ask unknown faces for their name
---en-voice NAME      Piper TTS voice (default: en_US-lessac-medium)
---db-dir DIR         Face database directory (default: known_faces)
---people-dir DIR     People memory directory (default: people)
-```
+
+The test shows live `raw` (mic with echo) and `clean` (after AEC) levels.
+The AEC typically reduces echo from ~0.80 RMS down to ~0.002 RMS.
