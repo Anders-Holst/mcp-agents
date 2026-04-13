@@ -3,7 +3,7 @@ name = "face-recognition"
 version = "0.1.0"
 description = "Face recognition app that learns faces over time"
 channels = ["conda-forge"]
-platforms = ["osx-arm64"]
+platforms = ["osx-arm64", "linux-64"]
 
 [dependencies]
 python = ">=3.11,<3.13"
