@@ -37,6 +37,11 @@ INTERVIEW_TOPICS: list[str] = [
 ]
 
 
+def _is_person_id(name: str) -> bool:
+    """Return True if name looks like a person ID (e.g. 'p001')."""
+    return bool(re.match(r"^p\d+$", name))
+
+
 @dataclass
 class DialogueEntry:
     """A single exchange in a conversation."""
@@ -68,7 +73,8 @@ class Person:
 
     @property
     def is_identified(self) -> bool:
-        return self.name is not None
+        """True if the person has a real name (not None, not a person ID like 'p001')."""
+        return self.name is not None and not _is_person_id(self.name)
 
     def to_dict(self) -> dict:
         return {
@@ -349,14 +355,40 @@ class PeopleMemory:
         if person.is_identified:
             self._save(person)
 
+    @staticmethod
+    def _fact_similar(a: str, b: str) -> bool:
+        """Check if two facts are similar enough to be duplicates.
+
+        Normalizes case, punctuation, and common prefixes like the
+        person's name, then checks if the shorter string is contained
+        in the longer one.
+        """
+        import re
+        def normalize(s):
+            s = s.lower().strip().rstrip(".")
+            # Strip leading name/pronoun patterns
+            s = re.sub(r"^(joakim|the person|he|she|they)\s+(is|likes?|has|was|mentioned)\s+", "", s)
+            s = re.sub(r"^(is|likes?|has|was|mentioned)\s+", "", s)
+            return s
+        na, nb = normalize(a), normalize(b)
+        if na == nb:
+            return True
+        # Check containment
+        short, long = (na, nb) if len(na) <= len(nb) else (nb, na)
+        return len(short) > 5 and short in long
+
     def add_fact(self, track_id: int, fact: str):
-        """Add a fact about a person (deduplicates)."""
+        """Add a fact about a person (deduplicates by similarity)."""
         person = self.get_or_create(track_id)
-        if fact not in person.facts:
-            person.facts.append(fact)
-            logger.info(f"New fact about track {track_id} ({person.name or '?'}): {fact}")
-            if person.is_identified:
-                self._save(person)
+        for existing in person.facts:
+            if self._fact_similar(fact, existing):
+                logger.debug(f"Duplicate fact skipped for track {track_id}: "
+                             f"{fact!r} ~ {existing!r}")
+                return
+        person.facts.append(fact)
+        logger.info(f"New fact about track {track_id} ({person.name or '?'}): {fact}")
+        if person.is_identified:
+            self._save(person)
 
     def replace_fact(self, track_id: int, old_fact: str, new_fact: str):
         """Replace an existing fact with an updated version."""

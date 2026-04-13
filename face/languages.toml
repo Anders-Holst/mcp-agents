@@ -247,3 +247,50 @@ favourite_music = [
     "Hey {name}, hast du Lieblingskünstler?",
     "Hallo {name}! Was hörst du gerne?",
 ]
+
+# ── Italian ─────────────────────────────────────────────────────────
+
+[languages.it]
+tts_model = "it_IT-paola-medium"
+
+greetings = [
+    "Ciao {name}!",
+    "Ehi {name}!",
+    "Ciao {name}, che bello vederti!",
+    "Bentornato, {name}!",
+    "Ciao di nuovo, {name}!",
+]
+
+goodbyes = [
+    "Arrivederci, {name}!",
+    "A presto, {name}!",
+    "Ciao {name}, ci vediamo!",
+]
+
+ask_name = [
+    "Ciao! Come ti chiami?",
+    "Ehi, non credo che ci siamo già incontrati — come ti chiami?",
+    "Ciao! Qual è il tuo nome?",
+]
+
+[languages.it.interview]
+favourite_colour = [
+    "Ciao {name}! Qual è il tuo colore preferito?",
+    "Ehi {name}, che colore ti piace di più?",
+    "Ciao {name}! Hai un colore preferito?",
+]
+hobby = [
+    "Ciao {name}! Cosa ti piace fare nel tempo libero?",
+    "Ehi {name}, hai degli hobby?",
+    "Ciao {name}! Cosa fai per divertirti?",
+]
+favourite_food = [
+    "Ciao {name}! Qual è il tuo piatto preferito?",
+    "Ehi {name}, cosa ti piace mangiare?",
+    "Ciao {name}! Hai un piatto preferito?",
+]
+favourite_music = [
+    "Ciao {name}! Che musica ascolti?",
+    "Ehi {name}, hai degli artisti preferiti?",
+    "Ciao {name}! Cosa ti piace ascoltare?",
+]

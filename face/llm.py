@@ -24,6 +24,7 @@ from pydantic_ai import Agent as PydanticAgent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
+from pydantic_ai.usage import UsageLimits
 
 from people_memory import PeopleMemory
 
@@ -214,7 +215,8 @@ class ConversationLLM:
             return self._canned_greeting(name, interview_topic, language)
 
         context = memory.get_context_for_llm(track_id, max_dialogues=5)
-        lang_instruction = f"Reply in {language}." if language != "en" else ""
+        lang_name = self._LANG_NAMES.get(language, language)
+        lang_instruction = f"You MUST reply in {lang_name}." if language != "en" else ""
         if interview_topic:
             prompt = f"""Greet this person warmly by name, then in the same reply ask one friendly, natural question about their {interview_topic.replace('_', ' ')}.
 Keep the whole reply to 1-2 short sentences. No markdown or emojis. {lang_instruction}
@@ -246,6 +248,15 @@ Emotion: {emotion or 'neutral'}"""
                 return random.choice(options).format(name=name)
         return random.choice(greetings).format(name=name) if greetings else f"Hello {name}!"
 
+    _LANG_NAMES = {
+        "en": "English", "sv": "Swedish", "fr": "French",
+        "es": "Spanish", "de": "German", "fi": "Finnish",
+        "no": "Norwegian", "da": "Danish", "nl": "Dutch",
+        "it": "Italian", "pt": "Portuguese", "pl": "Polish",
+        "ja": "Japanese", "zh": "Chinese", "ko": "Korean",
+        "el": "Greek", "ru": "Russian", "ar": "Arabic",
+    }
+
     def generate_response(self, memory: PeopleMemory, track_id: Optional[int],
                           heard_text: str, language: str = "en") -> str:
         """Generate a conversational response.
@@ -259,12 +270,21 @@ Emotion: {emotion or 'neutral'}"""
         else:
             context = "Unknown person."
 
-        prompt = f"""They said: "{heard_text}" (language: {language})
+        lang_name = self._LANG_NAMES.get(language, language)
+        prompt = f"""They said: "{heard_text}"
 {context}
 
-Reply naturally in their language in 1-2 short sentences. Address them by name when it fits. You may reference what you already know about them (facts, earlier conversation) if it makes the reply more personal — but only when it genuinely fits."""
+You MUST reply in {lang_name}. Keep it to 1-2 short sentences. Address them by name when it fits. You may reference what you already know about them (facts, earlier conversation) if it makes the reply more personal."""
 
-        return self._call_llm(prompt, "response", f"I heard you say: {heard_text}")
+        # Fallback echoes in the detected language
+        _fallbacks = {
+            "sv": "Jag hörde dig säga: ",
+            "fr": "Je t'ai entendu dire : ",
+            "es": "Te escuché decir: ",
+            "de": "Ich habe gehört, du sagst: ",
+        }
+        prefix = _fallbacks.get(language, "I heard you say: ")
+        return self._call_llm(prompt, "response", f"{prefix}{heard_text}")
 
     def extract_facts_with_tools(self, memory: PeopleMemory, track_id: int,
                                 person_said: str, agent_said: str = ""):
@@ -280,17 +300,16 @@ Reply naturally in their language in 1-2 short sentences. Address them by name w
         person_id = person.persistent_id or ""
         context = memory.get_context_for_llm(track_id, max_dialogues=5)
 
-        prompt = f"""Use the tools to store any personal facts from this conversation!
+        prompt = f"""Here is what we know about this person:
 
 {context}
 
 The person just said: "{person_said}"
 
-Call write_fact for each NEW fact (job, hobbies, family, location, favourites,
-likes/dislikes). Make facts self-contained ("Favourite food is sushi" not "sushi").
-Call replace_fact if a fact UPDATES an old one (e.g. favourite food changed).
-Call set_name if they stated or corrected their name.
-If nothing new, say "Nothing new." """
+Look at the "Known facts" above. Only call write_fact for facts that are
+NOT already listed. Do NOT repeat existing facts.
+If the person revealed something genuinely new, call write_fact.
+If nothing new was revealed, say "Nothing new." """
 
         deps = ConversationDeps(
             memory=memory, track_id=track_id, person_id=person_id)
@@ -309,18 +328,29 @@ If nothing new, say "Nothing new." """
     def _make_tool_agent(self) -> PydanticAgent:
         """Create a pydantic-ai agent with write_fact, replace_fact, set_name.
 
-        No reasoning_effort:none here — gemma4 needs thinking enabled to call tools.
+        Thinking stays enabled here -- the model needs reasoning to decide
+        which tools to call and to produce quality facts.
         """
         agent = PydanticAgent(
             self._model,
-            system_prompt="You extract personal facts from conversations. Use the tools to store facts about the user!",
+            system_prompt=(
+                "You are a fact extraction assistant. Your ONLY job is to use "
+                "the tools to store NEW personal facts about the person.\n\n"
+                "Rules:\n"
+                "- NEVER store a fact that is already in the Known facts list.\n"
+                "- Only call write_fact for genuinely NEW information.\n"
+                "- Call replace_fact when a fact updates or contradicts an "
+                "existing one.\n"
+                "- Call set_name if they state or correct their name.\n"
+                "- If nothing new was said, do NOT call any tools."
+            ),
             deps_type=ConversationDeps,
             toolsets=self._mcp_servers,
         )
 
         @agent.tool
         def write_fact(ctx: RunContext[ConversationDeps], fact: str) -> str:
-            """Remember a personal fact about the person."""
+            """Remember a personal fact about the person. Always write the fact in English, translating if needed."""
             logger.info(f"[TOOL:write_fact] {fact}")
             ctx.deps.memory.add_fact(ctx.deps.track_id, fact)
             return "Stored."
@@ -336,22 +366,42 @@ If nothing new, say "Nothing new." """
         def set_name(ctx: RunContext[ConversationDeps], name: str) -> str:
             """Update the person's name if they corrected or stated it."""
             logger.info(f"[TOOL:set_name] {name}")
-            if ctx.deps.person_id:
-                ctx.deps.memory.rename(ctx.deps.person_id, name)
+            # Re-read person_id from live object — _try_learn_name may
+            # have created the person concurrently.
+            person = ctx.deps.memory.get(ctx.deps.track_id)
+            pid = (person.persistent_id if person else None) or ctx.deps.person_id
+            if pid:
+                ctx.deps.memory.rename(pid, name)
+            else:
+                # New person — create a persistent record
+                ctx.deps.memory.create_person(ctx.deps.track_id, name)
             return "Name updated."
 
         return agent
 
     async def _arun_with_tools(self, prompt: str, deps: ConversationDeps) -> str:
-        """Run the tool-calling agent (write_fact, replace_fact, set_name)."""
+        """Run the tool-calling agent (write_fact, replace_fact, set_name).
+
+        Uses request_limit=2: request 1 = model calls tools, request 2 =
+        model sees tool results and responds. This works around an Ollama
+        /v1 bug where a 3rd request (pydantic-ai retry after an empty
+        assistant message) includes content:null which Ollama rejects.
+        """
+        from pydantic_ai.exceptions import UsageLimitExceeded
+        limits = UsageLimits(request_limit=2)
         agent = self._make_tool_agent()
-        if self._mcp_servers:
-            async with agent:
-                result = await agent.run(prompt, deps=deps)
+        try:
+            if self._mcp_servers:
+                async with agent:
+                    result = await agent.run(prompt, deps=deps, usage_limits=limits)
+                    return result.output.strip()
+            else:
+                result = await agent.run(prompt, deps=deps, usage_limits=limits)
                 return result.output.strip()
-        else:
-            result = await agent.run(prompt, deps=deps)
-            return result.output.strip()
+        except UsageLimitExceeded:
+            # Tools already ran — the limit just prevented the
+            # problematic retry that Ollama can't handle.
+            return "Tools executed."
 
     def generate_ask_name(self, track_id: int, language: str = "en") -> str:
         """Return a random 'what's your name?' prompt. Always canned."""

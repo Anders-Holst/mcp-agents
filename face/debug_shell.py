@@ -10,6 +10,7 @@ Used in two modes:
 
 import json
 import logging
+import time
 from typing import Optional
 
 from people_memory import PeopleMemory, INTERVIEW_TOPICS
@@ -37,11 +38,13 @@ Agent commands (only when running inside the agent):
   speak <text>               Speak text via TTS
   status                     Show agent busy/listener state (for debugging)
   pause / resume             Pause/resume speech listening
+  reset                      Unstick the agent (clear busy, resume listener)
+  reload                     Reload people data from disk
 """
 
 GENERIC_HELP = """\
   help                       Show this message
-  quit / exit                Leave the shell (does not stop the agent)
+  quit / exit                Shut down the agent and exit
 """
 
 
@@ -110,7 +113,11 @@ def run_shell(mem: PeopleMemory, agent: Optional[object] = None):
 
         # --- exit ---
         if cmd in ("quit", "exit", "q"):
-            return
+            if agent and hasattr(agent, 'stop'):
+                print("Shutting down agent...")
+                agent.stop()
+            import os
+            os._exit(0)
         elif cmd == "help":
             print(help_text)
 
@@ -320,6 +327,33 @@ def run_shell(mem: PeopleMemory, agent: Optional[object] = None):
         elif agent and cmd == "resume":
             agent.resume_listening()
             print("Listening resumed.")
+        elif agent and cmd == "reset":
+            print("Resetting agent state...")
+            # Clear busy flag
+            agent._clear_busy()
+            agent.state = "LISTENING"
+            # Unpause and cancel any stuck listen
+            agent.voice_in._cancel_listen = True
+            agent.voice_out.speaking = False
+            # Stop any lingering AEC stream
+            echo = agent._echo_detector
+            if echo and echo.active:
+                echo.stop()
+                print("  stopped AEC stream")
+            # Resume listener
+            time.sleep(0.3)
+            agent.voice_in._cancel_listen = False
+            agent.resume_listening()
+            print("  busy cleared, listener resumed")
+        elif agent and cmd == "reload":
+            print("Reloading people from disk...")
+            mem.load()
+            # Re-identify any active faces
+            for face in agent.tracker.get_visible_faces():
+                pid = agent.tracker.get_person_id(face.track_id)
+                if pid:
+                    mem.identify(face.track_id, pid)
+            print(f"  loaded {len(mem.known_names)} people")
 
         else:
             print(f"Unknown or incomplete command: {line!r}. Type 'help'.")

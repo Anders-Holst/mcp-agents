@@ -398,11 +398,9 @@ class Agent:
             self._handle_face_disappeared(event)
             return
 
-        if self._busy:
-            if event.type in (FaceEventType.FACE_APPEARED, FaceEventType.IDENTITY_CONFIRMED):
-                logger.info(f"[AGENT] SKIPPED {event.type.name} for track {event.track_id} — agent busy")
-            return
-
+        # Always update memory identification even when busy — only
+        # skip the greeting speech. Otherwise "Unknown person" persists
+        # and facts/names can't be recorded.
         if event.type == FaceEventType.IDENTITY_CONFIRMED:
             self._handle_identity_confirmed(event)
         elif event.type == FaceEventType.FACE_APPEARED:
@@ -549,8 +547,10 @@ class Agent:
             self.state = "TALKING"
             self.speak(response, language=lang)
 
-            # Background fact extraction — safety net in case tools didn't fire
-            if tid and person and person.is_identified:
+            # Background fact extraction — runs for both identified and
+            # unidentified people so set_name can catch names from
+            # normal conversation (not just the ask-name flow).
+            if tid and person:
                 threading.Thread(target=self._extract_facts,
                                  args=(tid, text),
                                  daemon=True).start()
