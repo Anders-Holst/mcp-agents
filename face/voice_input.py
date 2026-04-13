@@ -36,9 +36,9 @@ logger = logging.getLogger("voice_input")
 SAMPLE_RATE = 16000
 RECORD_SECONDS = 4
 VAD_THRESHOLD = 0.7
-VAD_SILENCE_MS = 600
-VAD_MAX_SPEECH_S = 10
-VAD_PRE_SPEECH_MS = 300
+VAD_SILENCE_MS = 1200
+VAD_MAX_SPEECH_S = 15
+VAD_PRE_SPEECH_MS = 500
 AUDIO_METER_DECAY = 0.92
 NOISE_REDUCE = True
 
@@ -246,7 +246,7 @@ class EchoDetector:
         self._speech_threshold = speech_threshold
         self._min_chunks = max(1, min_duration_ms // 10)  # 10ms frames
         self._stream: Optional[sd.Stream] = None
-        self._output_buffer: list[np.ndarray] = []
+        self._output_buffer: collections.deque[np.ndarray] = collections.deque()
         self._output_finished = False
         self._stop_event = threading.Event()
         self._above_count: int = 0
@@ -309,14 +309,13 @@ class EchoDetector:
 
             # --- Output: play from buffer ---
             if self._output_buffer:
-                chunk = self._output_buffer[0]
+                chunk = self._output_buffer.popleft()
                 if len(chunk) <= frames:
                     outdata[:len(chunk), 0] = chunk
                     outdata[len(chunk):, 0] = 0
-                    self._output_buffer.pop(0)
                 else:
                     outdata[:, 0] = chunk[:frames]
-                    self._output_buffer[0] = chunk[frames:]
+                    self._output_buffer.appendleft(chunk[frames:])
             else:
                 outdata[:, 0] = 0
                 if self._output_finished:
@@ -445,7 +444,7 @@ class VoiceInput:
     """
 
     def __init__(self, *,
-                 whisper_model_size: str = "base",
+                 whisper_model_size: str = "medium",
                  whisper_compute_type: str = "int8",
                  sample_rate: int = SAMPLE_RATE,
                  vad_threshold: float = VAD_THRESHOLD,

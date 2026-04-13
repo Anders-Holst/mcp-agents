@@ -11,6 +11,7 @@ Can be run standalone:
     python voice_output.py --interactive
 """
 
+import collections
 import os
 import time
 import threading
@@ -135,6 +136,7 @@ class VoiceOutput:
         self._language_models = dict(language_models or LANGUAGE_MODELS)
         # Loaded PiperVoice instances keyed by model name
         self._voices: dict[str, PiperVoice] = {}
+        self._model_lock = threading.Lock()  # protects _voices lazy loading
         self._ready = False
         self._speaking = False
         self._stop_event = threading.Event()
@@ -159,6 +161,10 @@ class VoiceOutput:
     def speaking(self) -> bool:
         return self._speaking
 
+    @speaking.setter
+    def speaking(self, value: bool):
+        self._speaking = value
+
     # --- Lifecycle ---
 
     def load(self):
@@ -174,24 +180,28 @@ class VoiceOutput:
         self._load_model(self._default_model)
 
     def _load_model(self, model_name: str):
-        """Load a single piper model by name (downloads if needed)."""
-        if model_name in self._voices:
-            return
-        self._emit(TtsEventType.MODEL_LOADING,
-                   ModelLoadingPayload(model_name))
-        try:
-            self._ensure_model(model_name)
-            model_path = os.path.join(self._model_dir, f"{model_name}.onnx")
-            logger.info(f"Loading piper model: {model_name}...")
-            self._voices[model_name] = PiperVoice.load(model_path)
-            self._ready = True
-            self._emit(TtsEventType.MODEL_READY,
-                       ModelReadyPayload(model_name))
-            logger.info(f"Piper TTS loaded: {model_name}")
-        except Exception as e:
-            self._emit(TtsEventType.MODEL_LOAD_FAILED,
-                       ModelLoadFailedPayload(model_name, str(e)))
-            logger.error(f"Failed to load piper model {model_name}: {e}")
+        """Load a single piper model by name (downloads if needed).
+
+        Thread-safe: uses _model_lock to prevent duplicate loads.
+        """
+        with self._model_lock:
+            if model_name in self._voices:
+                return
+            self._emit(TtsEventType.MODEL_LOADING,
+                       ModelLoadingPayload(model_name))
+            try:
+                self._ensure_model(model_name)
+                model_path = os.path.join(self._model_dir, f"{model_name}.onnx")
+                logger.info(f"Loading piper model: {model_name}...")
+                self._voices[model_name] = PiperVoice.load(model_path)
+                self._ready = True
+                self._emit(TtsEventType.MODEL_READY,
+                           ModelReadyPayload(model_name))
+                logger.info(f"Piper TTS loaded: {model_name}")
+            except Exception as e:
+                self._emit(TtsEventType.MODEL_LOAD_FAILED,
+                           ModelLoadFailedPayload(model_name, str(e)))
+                logger.error(f"Failed to load piper model {model_name}: {e}")
 
     def _ensure_model(self, model_name: str):
         os.makedirs(self._model_dir, exist_ok=True)
@@ -267,7 +277,7 @@ class VoiceOutput:
 
     def _play(self, text: str, voice: PiperVoice):
         sr = voice.config.sample_rate
-        buffer = []
+        buffer = collections.deque()
         finished = threading.Event()
         stop = self._stop_event
 
@@ -276,14 +286,14 @@ class VoiceOutput:
                 outdata[:, 0] = 0
                 raise sd.CallbackStop
             if buffer:
-                chunk = buffer.pop(0)
+                chunk = buffer.popleft()
                 if len(chunk) < frames:
                     outdata[:len(chunk), 0] = chunk
                     outdata[len(chunk):, 0] = 0
                 else:
                     outdata[:, 0] = chunk[:frames]
                     if len(chunk) > frames:
-                        buffer.insert(0, chunk[frames:])
+                        buffer.appendleft(chunk[frames:])
             else:
                 outdata[:, 0] = 0
                 if finished.is_set():

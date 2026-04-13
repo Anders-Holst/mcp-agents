@@ -206,28 +206,31 @@ class Agent:
 
     @property
     def busy(self) -> bool:
-        if self._busy and self._busy_since > 0:
-            elapsed = time.time() - self._busy_since
-            if elapsed > self._busy_timeout:
-                logger.warning(
-                    f"[AGENT] busy timeout ({elapsed:.0f}s > {self._busy_timeout}s), "
-                    f"reason was: {self._busy_reason}. Force-clearing.")
-                self._busy = False
-                self._busy_reason = ""
-                self._busy_since = 0
-                self.resume_listening()
-        return self._busy
+        with self._busy_lock:
+            if self._busy and self._busy_since > 0:
+                elapsed = time.time() - self._busy_since
+                if elapsed > self._busy_timeout:
+                    logger.warning(
+                        f"[AGENT] busy timeout ({elapsed:.0f}s > {self._busy_timeout}s), "
+                        f"reason was: {self._busy_reason}. Force-clearing.")
+                    self._busy = False
+                    self._busy_reason = ""
+                    self._busy_since = 0
+                    self.resume_listening()
+            return self._busy
 
     def _set_busy(self, reason: str):
+        """Must be called with _busy_lock held."""
         self._busy = True
         self._busy_since = time.time()
         self._busy_reason = reason
         logger.info(f"[AGENT] busy: {reason}")
 
     def _clear_busy(self):
-        self._busy = False
-        self._busy_reason = ""
-        self._busy_since = 0
+        with self._busy_lock:
+            self._busy = False
+            self._busy_reason = ""
+            self._busy_since = 0
 
     def pause_listening(self):
         if self._listener:
@@ -250,8 +253,24 @@ class Agent:
         Uses a full-duplex audio stream: TTS plays through speakers while
         the mic is processed by WebRTC's echo canceller. The echo-cancelled
         residual is monitored — if a human voice is detected, TTS stops.
+
+        Falls back to simple output-only playback if the AEC stream fails.
         """
         self.pause_listening()
+        aec_ok = self._speak_aec(text, language)
+        if not aec_ok:
+            logger.warning("[AGENT] AEC playback failed, falling back to simple TTS")
+            self.voice_out.speak(text, language)
+        # Let room reverb decay before the listener reopens the mic
+        time.sleep(0.5)
+        self.resume_listening()
+
+    def _speak_aec(self, text: str, language: str = None) -> bool:
+        """Try to speak via AEC full-duplex stream.
+
+        Returns True if audio played successfully, False if it failed
+        (caller should fall back to simple playback).
+        """
         echo = EchoDetector()
         self._echo_detector = echo
 
@@ -259,7 +278,7 @@ class Agent:
             voice = self.voice_out._get_voice(language)
             if voice is None:
                 logger.warning("[AGENT] TTS not ready, skipping speak")
-                return
+                return False
 
             # Synthesize TTS audio and resample to mic rate for the
             # full-duplex stream
@@ -281,33 +300,62 @@ class Agent:
 
             # Start full-duplex playback + AEC monitoring
             echo.start(tts_sample_rate=stream_sr)
-            self.voice_out._speaking = True
+            self.voice_out.speaking = True
             start = time.time()
+            max_duration = 30.0  # safety timeout
+            stall_limit = 2.0   # no output for this long = stuck
+            last_output_time = start
             logger.info(f"[AEC] playing TTS via full-duplex stream")
 
             # Wait for playback to finish or barge-in
             while echo.active:
+                now = time.time()
+                elapsed = now - start
+
                 if echo.user_speaking:
                     echo.stop()
                     logger.info(
                         f"[AGENT] barge-in detected — stopping TTS "
                         f"(clean_rms={echo.clean_rms:.4f})")
                     break
+
+                # Track when output was last non-zero
+                if echo.output_rms > 0.001:
+                    last_output_time = now
+
+                # Stall detection: stream claims active but nothing playing
+                if now - last_output_time > stall_limit and elapsed > stall_limit:
+                    echo.stop()
+                    logger.warning(
+                        f"[AEC] stall detected — no output for "
+                        f"{now - last_output_time:.1f}s, forcing stop")
+                    break
+
+                if elapsed > max_duration:
+                    echo.stop()
+                    logger.warning(
+                        f"[AEC] timeout after {elapsed:.1f}s, forcing stop")
+                    break
+
                 time.sleep(0.05)
 
             duration = time.time() - start
-            self.voice_out._speaking = False
+            self.voice_out.speaking = False
             logger.info(f"[AEC] TTS done ({duration:.1f}s)")
 
+            # If playback was suspiciously short, the stream likely failed
+            if duration < 1.0:
+                logger.warning(f"[AEC] playback too short ({duration:.1f}s), treating as failure")
+                return False
+            return True
+
         except Exception as e:
-            logger.warning(f"[AGENT] speak failed: {e}", exc_info=True)
-            self.voice_out._speaking = False
+            logger.warning(f"[AGENT] AEC speak failed: {e}", exc_info=True)
+            self.voice_out.speaking = False
+            return False
         finally:
             echo.stop()
             self._echo_detector = None
-            # Let room reverb decay before the listener reopens the mic
-            time.sleep(0.5)
-            self.resume_listening()
 
     def ask_name(self, track_id: int, frame=None):
         """Manually trigger asking an unknown face for their name."""
@@ -380,19 +428,33 @@ class Agent:
 
         tid = event.track_id
         person = self.memory.get(tid) or self.memory.get_by_id(pid)
-        name = person.name if person else pid
+        name = person.name if person else None
+        if not name:
+            logger.info(f"[AGENT] FACE_DISAPPEARED: track={tid} pid={pid} (no name, skipping goodbye)")
+            return
         logger.info(f"[AGENT] FACE_DISAPPEARED: track={tid} name={name} duration={p.duration_visible:.1f}s")
 
         text = f"Goodbye, {name}!"
         self._emit(AgentEventType.GOODBYE, GoodbyePayload(
             track_id=tid, name=name, text=text,
         ))
-        # Skip TTS if the agent is already speaking — avoids lock contention
-        if self.voice_out.speaking or self._busy:
-            logger.info(f"[AGENT] skipping goodbye speech (busy)")
-            return
+        # Acquire busy lock to prevent overlapping speech
+        with self._busy_lock:
+            if self.voice_out.speaking or self._busy:
+                logger.info(f"[AGENT] skipping goodbye speech (busy)")
+                return
+            self._set_busy("goodbye")
         lang = person.last_language if person else None
-        self.speak(text, language=lang or None)
+
+        def _do_goodbye():
+            try:
+                self.speak(text, language=lang or None)
+            finally:
+                self._clear_busy()
+
+        # Run on a background thread — this callback runs on the main
+        # (camera) thread, and speak() is blocking.
+        threading.Thread(target=_do_goodbye, daemon=True).start()
 
     # --- Periodic check for unknown faces (called from outside or a timer) ---
 

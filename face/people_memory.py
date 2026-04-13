@@ -174,15 +174,21 @@ class PeopleMemory:
             if not fname.endswith(".json"):
                 continue
             fpath = os.path.join(self._dir, fname)
+            pid = fname[:-5]
             try:
                 with open(fpath, "r") as f:
-                    data = json.load(f)
-                pid = fname[:-5]
+                    content = f.read().strip()
+                if not content:
+                    raise ValueError("empty file")
+                data = json.loads(content)
                 data["persistent_id"] = pid
                 self._stored[pid] = data
                 count += 1
             except Exception as e:
-                logger.warning(f"Failed to load {fpath}: {e}")
+                logger.warning(f"Failed to load {fpath}: {e}, creating skeleton record")
+                data = {"persistent_id": pid, "name": pid}
+                self._stored[pid] = data
+                count += 1
         logger.info(f"People memory loaded: {count} people from {self._dir}/")
 
     def next_person_id(self) -> str:
@@ -460,7 +466,11 @@ class PeopleMemory:
     # --- Persistence ---
 
     def _save(self, person: Person):
-        """Save a person to disk (only if identified)."""
+        """Save a person to disk (only if identified).
+
+        Uses atomic write (temp file + rename) to prevent corruption
+        from concurrent saves.
+        """
         if not person.is_identified or not person.persistent_id:
             return
         pid = person.persistent_id
@@ -469,8 +479,10 @@ class PeopleMemory:
             self._stored[pid] = data
         os.makedirs(self._dir, exist_ok=True)
         fpath = os.path.join(self._dir, f"{pid}.json")
-        with open(fpath, "w") as f:
+        tmp_path = fpath + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, fpath)
 
     def save_all(self):
         """Save all identified active people."""
