@@ -32,7 +32,9 @@ from face_tracker import (
 import cv2
 
 ollama_config = {
-    "model": "PetrosStav/gemma3-tools:12b",
+    "model": "llama3.1",
+    #"model": "google/gemma-4-E4B-it",
+    #"model": "PetrosStav/gemma3-tools:12b",
     "base_url": "http://localhost:11434/v1/",
     "api_key": "ollama"
 }
@@ -183,13 +185,13 @@ def language_message(lang):
 
 def greet_prompt():
     if not curr_person.name:
-        return {'role':'system', 'content':'There is a new person in front of you. Produce a greeting and ask for the name.'}
+        return {'role':'user', 'content':'There is a new person in front of you. Produce a greeting and ask for the name.'}
     if curr_person.lasttime is None:
-        return {'role':'system', 'content': f'The person {curr_person.name} has appeared in front of you. Produce a suitable greeting.'}
+        return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. Produce a suitable greeting.'}
     duration = int((time.time() - curr_person.lasttime) / 60)
-    return {'role':'system', 'content': f'The person {curr_person.name} has appeared in front of you. It was {duration} minutes since you last met. Produce a suitable greeting.'}
+    return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. It was {duration} minutes since you last met. Produce a suitable greeting.'}
 
-def compose_messages(sysp, mlst, augs):
+def compose_messages(sysp, mlst, augs, greet):
     n = 0
     i1 = 0
     i2 = 0
@@ -201,7 +203,10 @@ def compose_messages(sysp, mlst, augs):
             if n == messages_trunclen:
                 i1 = i
                 break
-    return [sysp] + mlst[i1:i2] + augs + mlst[i2:]
+    if greet:
+        return [sysp] + mlst + augs + [greet]
+    else:
+        return [sysp] + mlst[i1:i2] + augs + mlst[i2:]
 
 def clear_messages():
     global messages
@@ -285,7 +290,7 @@ async def main():
                  'talk':      ((0.95, 0.75, 0), "~~~", ""),
                  }
         if has_name:
-            tmp = await client.read_resource("url://get_service_name")
+            tmp = await client.read_resource("url://service_name")
             name = tmp[0].text
         else:
             name = "MCP Speech Client"
@@ -431,6 +436,7 @@ async def main():
                 sysprompt = await system_message(client, lang)
                 augprompt = await augmentation_message(client, lang)
                 augpromptlist = []
+                greetprompt = False
                 if augprompt:
                     print("\n  Augmentation:")
                     print(augprompt['content'])
@@ -438,15 +444,18 @@ async def main():
                 if newstate == 'greet':
                     greetprompt = greet_prompt()
                     if greetprompt:
-                        augpromptlist.append(greetprompt)
+                        print("\n  Greeting:")
+                        print(greetprompt['content'])
                 augpromptlist.append(langprompt)
                 if newstate == 'process':
                     print("\n  User: (", lang, ") ", prompt)
                     messages.append(user_message(prompt))
 
+                msg = compose_messages(sysprompt, messages, augpromptlist, greetprompt)
+                print(msg)
                 response = openai.chat.completions.create(
                     model=model,
-                    messages=compose_messages(sysprompt, messages, augpromptlist),
+                    messages=msg,
                     tools=tools,
                 )
     
@@ -460,12 +469,12 @@ async def main():
                             result_message = {
                                 "role": "tool",
                                 "content": json.dumps({
-                                    "result": result[0].text
+                                    "result": result.content[0].text
                                 }),
                                 "tool_call_id": tool_call.id
                             }
                             print("\n  Function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
-                            print(  "  Result:   ", result[0].text)
+                            print(  "  Result:   ", result.content[0].text)
                             messages.append(result_message)
                         except exceptions.ToolError:
                             result_message = {
@@ -478,9 +487,11 @@ async def main():
                             print("\n  Unknown function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
                             messages.append(result_message)
     
+                    msg = compose_messages(sysprompt, messages, augpromptlist, greetprompt)
+                    print(msg)
                     response = openai.chat.completions.create(
                         model=model,
-                        messages=compose_messages(sysprompt, messages, augpromptlist),
+                        messages=msg,
                         tools=tools,
                     )
                     tool_calls = response.choices[0].message.tool_calls
@@ -491,7 +502,8 @@ async def main():
                 print(f'\n  Response: {reply_text}')
                 set_win_state('talk')
                 if reply_text:
-                    voice_out.speak(reply_text)
+                    #voice_out.speak(reply_text)
+                    speak(reply_text, lang)
                 set_state(state, 'listen')
                 if listener:
                     listener.paused = False
