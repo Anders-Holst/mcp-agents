@@ -117,7 +117,11 @@ if __name__ == "__main__":
     parser.add_argument('--host', default="127.0.0.1", help='Host to bind to')
     parser.add_argument('--port', default=8000, type=int, help='Port to bind to')
     parser.add_argument('--transport', default="sse", help='Transport to use (stdio, sse or http)')
+    parser.add_argument('--simulate-robot', action='store_true', help='Simulate the robot arm instead of using real hardware')
+    parser.add_argument('--simulate-camera', action='store_true', help='Simulate the camera instead of using real hardware')
     args = parser.parse_args()
+    use_robot = not args.simulate_robot
+    use_camera = not args.simulate_camera
     if args.transport != "stdio":
         mcp.run(transport=args.transport, host=args.host, port=args.port)
     else:
