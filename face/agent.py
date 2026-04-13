@@ -27,7 +27,7 @@ import numpy as np
 from voice_input import VoiceInput, AudioMonitor, ContinuousListener, EchoDetector
 from voice_output import VoiceOutput
 from people_memory import PeopleMemory
-from llm import ConversationLLM
+from llm import ConversationLLM, get_goodbye
 
 logger = logging.getLogger("agent")
 
@@ -159,6 +159,10 @@ class Agent:
         # High-level state for UI display
         self.state: str = "IDLE"  # IDLE, LISTENING, TRANSCRIBING, THINKING, TALKING
 
+        # AEC auto-disable: skip after repeated failures
+        self._aec_failures: int = 0
+        self._aec_disabled: bool = False
+
         # Cooldown tracking
         self._greeted: dict[str, float] = {}      # person_id -> timestamp
         self._asked: dict[int, float] = {}         # track_id -> timestamp
@@ -257,9 +261,17 @@ class Agent:
         Falls back to simple output-only playback if the AEC stream fails.
         """
         self.pause_listening()
-        aec_ok = self._speak_aec(text, language)
+        if self._aec_disabled:
+            aec_ok = False
+        else:
+            aec_ok = self._speak_aec(text, language)
+            if not aec_ok:
+                self._aec_failures += 1
+                if self._aec_failures >= 2:
+                    self._aec_disabled = True
+                    logger.warning("[AGENT] AEC failed twice, disabling for this session")
+                logger.warning("[AGENT] AEC playback failed, falling back to simple TTS")
         if not aec_ok:
-            logger.warning("[AGENT] AEC playback failed, falling back to simple TTS")
             self.voice_out.speak(text, language)
         # Let room reverb decay before the listener reopens the mic
         time.sleep(0.5)
@@ -308,6 +320,7 @@ class Agent:
             logger.info(f"[AEC] playing TTS via full-duplex stream")
 
             # Wait for playback to finish or barge-in
+            aec_failed = False
             while echo.active:
                 now = time.time()
                 elapsed = now - start
@@ -329,12 +342,14 @@ class Agent:
                     logger.warning(
                         f"[AEC] stall detected — no output for "
                         f"{now - last_output_time:.1f}s, forcing stop")
+                    aec_failed = True
                     break
 
                 if elapsed > max_duration:
                     echo.stop()
                     logger.warning(
                         f"[AEC] timeout after {elapsed:.1f}s, forcing stop")
+                    aec_failed = True
                     break
 
                 time.sleep(0.05)
@@ -343,10 +358,15 @@ class Agent:
             self.voice_out.speaking = False
             logger.info(f"[AEC] TTS done ({duration:.1f}s)")
 
-            # If playback was suspiciously short, the stream likely failed
             if duration < 1.0:
                 logger.warning(f"[AEC] playback too short ({duration:.1f}s), treating as failure")
                 return False
+            if aec_failed and duration < 3.0:
+                # Stalled early — likely no useful audio was played
+                return False
+            if aec_failed:
+                # Stalled late — most audio likely played, don't replay
+                logger.info(f"[AEC] stalled after {duration:.1f}s, skipping fallback (enough audio played)")
             return True
 
         except Exception as e:
@@ -434,7 +454,8 @@ class Agent:
             return
         logger.info(f"[AGENT] FACE_DISAPPEARED: track={tid} name={name} duration={p.duration_visible:.1f}s")
 
-        text = f"Goodbye, {name}!"
+        lang = person.last_language if person else None
+        text = get_goodbye(name, lang or "en")
         self._emit(AgentEventType.GOODBYE, GoodbyePayload(
             track_id=tid, name=name, text=text,
         ))
@@ -444,7 +465,6 @@ class Agent:
                 logger.info(f"[AGENT] skipping goodbye speech (busy)")
                 return
             self._set_busy("goodbye")
-        lang = person.last_language if person else None
 
         def _do_goodbye():
             try:
@@ -571,9 +591,11 @@ class Agent:
                     interview_topic = missing[0]
                     logger.info(f"[AGENT] interview: will ask {name} about {interview_topic}")
 
-            logger.info(f"[AGENT] _do_greet: generating greeting for {name} (emotion={emotion})")
+            lang = person.last_language if person else "en"
+            logger.info(f"[AGENT] _do_greet: generating greeting for {name} (emotion={emotion}, lang={lang})")
             greeting = self.llm.generate_greeting(
-                self.memory, track_id, emotion, interview_topic=interview_topic)
+                self.memory, track_id, emotion, interview_topic=interview_topic,
+                language=lang or "en")
             logger.info(f"[AGENT] _do_greet: greeting ready")
 
             if interview_topic:

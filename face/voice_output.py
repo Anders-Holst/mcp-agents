@@ -32,14 +32,15 @@ logger = logging.getLogger("voice_output")
 PIPER_MODEL_DIR = "piper_models"
 PIPER_MODEL_NAME = "en_US-lessac-medium"
 
-# Language code -> piper model name
-LANGUAGE_MODELS = {
-    "en": "en_US-lessac-medium",
-    "fr": "fr_FR-siwis-medium",
-    "sv": "sv_SE-nst-medium",
-    "es": "es_ES-davefx-medium",
-    "de": "de_DE-thorsten-medium",
-}
+# Language models loaded from languages.toml (with hardcoded fallback)
+def _load_language_models() -> dict[str, str]:
+    try:
+        from llm import get_language_models
+        return get_language_models()
+    except Exception:
+        return {"en": "en_US-lessac-medium"}
+
+LANGUAGE_MODELS = _load_language_models()
 DEFAULT_LANGUAGE = "en"
 
 
@@ -266,6 +267,8 @@ class VoiceOutput:
             duration = time.time() - start
             self._emit(TtsEventType.TTS_FINISHED,
                        TtsFinishedPayload(text, duration))
+        except Exception as e:
+            logger.error(f"TTS playback failed: {e}")
         finally:
             self._speaking = False
             self._lock.release()

@@ -7,14 +7,22 @@ import urllib.request
 
 PIPER_MODEL_DIR = "piper_models"
 
-# One model per language — medium quality, good general-purpose voices.
-MODELS = {
-    "en": "en_US-lessac-medium",
-    "fr": "fr_FR-siwis-medium",
-    "sv": "sv_SE-nst-medium",
-    "es": "es_ES-davefx-medium",
-    "de": "de_DE-thorsten-medium",
-}
+
+def _load_models_from_config() -> dict[str, str]:
+    """Load language -> tts_model mapping from languages.toml."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
+    config_path = os.path.join(os.path.dirname(__file__), "languages.toml")
+    with open(config_path, "rb") as f:
+        config = tomllib.load(f)
+    return {lang: cfg["tts_model"]
+            for lang, cfg in config.get("languages", {}).items()
+            if "tts_model" in cfg}
+
+
+MODELS = _load_models_from_config()
 
 
 def _piper_download_url(model_name: str) -> str:

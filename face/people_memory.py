@@ -186,7 +186,7 @@ class PeopleMemory:
                 count += 1
             except Exception as e:
                 logger.warning(f"Failed to load {fpath}: {e}, creating skeleton record")
-                data = {"persistent_id": pid, "name": pid}
+                data = {"persistent_id": pid, "name": None}
                 self._stored[pid] = data
                 count += 1
         logger.info(f"People memory loaded: {count} people from {self._dir}/")
@@ -254,7 +254,7 @@ class PeopleMemory:
             return  # already identified
 
         person.persistent_id = person_id
-        person.name = stored.get("name") or person_id
+        person.name = stored.get("name") or None
         person.facts = list(stored.get("facts", []))
         person.asked_topics = list(stored.get("asked_topics", []))
         person.summary = stored.get("summary", "")

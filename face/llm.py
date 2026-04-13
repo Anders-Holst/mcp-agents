@@ -10,6 +10,7 @@ To change the agent's personality or add new generation methods,
 edit this file.
 """
 
+import os
 import time
 import random
 import asyncio
@@ -36,43 +37,37 @@ logger = logging.getLogger("llm")
 # Canned greeting templates (used when smart_greetings=False)
 # ---------------------------------------------------------------------------
 
-_PLAIN_GREETINGS = [
-    "Hello, {name}!",
-    "Hi {name}!",
-    "Hey {name}, good to see you!",
-    "Welcome back, {name}!",
-    "Hi again, {name}!",
-]
+def _load_language_config(path: str = None) -> dict:
+    """Load languages.toml and return the parsed dict."""
+    if path is None:
+        path = os.path.join(os.path.dirname(__file__), "languages.toml")
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib  # Python < 3.11
+    with open(path, "rb") as f:
+        return tomllib.load(f)
 
-_INTERVIEW_GREETINGS: dict[str, list[str]] = {
-    "favourite_colour": [
-        "Hi {name}! What's your favourite colour?",
-        "Hey {name}, what colour do you like best?",
-        "Hello {name}! Got a favourite colour?",
-    ],
-    "hobby": [
-        "Hi {name}! What do you like doing for fun?",
-        "Hey {name}, got any hobbies you enjoy?",
-        "Hello {name}! What do you do in your spare time?",
-    ],
-    "favourite_food": [
-        "Hi {name}! What's your favourite food?",
-        "Hey {name}, what do you love to eat?",
-        "Hello {name}! Got a favourite dish?",
-    ],
-    "favourite_music": [
-        "Hi {name}! What music are you into?",
-        "Hey {name}, any favourite artists these days?",
-        "Hello {name}! What do you like listening to?",
-    ],
-}
+_LANG_CONFIG = _load_language_config()
+_DEFAULT_LANG = _LANG_CONFIG.get("default", "en")
+_LANGUAGES = _LANG_CONFIG.get("languages", {})
 
-_ASK_NAME_PROMPTS = [
-    "Hello! What's your name?",
-    "Hi there, I don't think we've met — what should I call you?",
-    "Hey! What's your name?",
-    "Hi! I don't recognise you — what's your name?",
-]
+def _get_lang(lang: str) -> dict:
+    """Return the config block for a language, falling back to default."""
+    return _LANGUAGES.get(lang, _LANGUAGES.get(_DEFAULT_LANG, {}))
+
+def get_language_models() -> dict[str, str]:
+    """Return {lang_code: tts_model_name} from the config."""
+    return {lang: cfg["tts_model"] for lang, cfg in _LANGUAGES.items()
+            if "tts_model" in cfg}
+
+def get_goodbye(name: str, language: str = "en") -> str:
+    """Return a random goodbye phrase for the given language."""
+    cfg = _get_lang(language)
+    goodbyes = cfg.get("goodbyes", _get_lang(_DEFAULT_LANG).get("goodbyes", []))
+    if goodbyes:
+        return random.choice(goodbyes).format(name=name)
+    return f"Goodbye, {name}!"
 
 
 SYSTEM_PROMPT = """\
@@ -204,7 +199,8 @@ class ConversationLLM:
 
     def generate_greeting(self, memory: PeopleMemory, track_id: int,
                           emotion: str = "",
-                          interview_topic: Optional[str] = None) -> str:
+                          interview_topic: Optional[str] = None,
+                          language: str = "en") -> str:
         """Return a greeting for ``track_id``.
 
         By default picks a random canned template — instant, no LLM call.
@@ -215,32 +211,40 @@ class ConversationLLM:
         name = person.name if person else "someone"
 
         if not self._smart_greetings:
-            return self._canned_greeting(name, interview_topic)
+            return self._canned_greeting(name, interview_topic, language)
 
         context = memory.get_context_for_llm(track_id, max_dialogues=5)
+        lang_instruction = f"Reply in {language}." if language != "en" else ""
         if interview_topic:
             prompt = f"""Greet this person warmly by name, then in the same reply ask one friendly, natural question about their {interview_topic.replace('_', ' ')}.
-Keep the whole reply to 1-2 short sentences. No markdown or emojis.
+Keep the whole reply to 1-2 short sentences. No markdown or emojis. {lang_instruction}
 {context}
 Emotion: {emotion or 'neutral'}"""
         else:
             prompt = f"""Greet this person by name in one short sentence. If you know something interesting about them from the context below (facts, recent conversation), you may weave it in — but only when it fits naturally.
+No markdown or emojis. {lang_instruction}
 {context}
 Emotion: {emotion or 'neutral'}"""
 
-        fallback = self._canned_greeting(name, interview_topic)
+        fallback = self._canned_greeting(name, interview_topic, language)
         return self._call_llm(prompt, "greeting", fallback)
 
     def _canned_greeting(self, name: str,
-                         interview_topic: Optional[str]) -> str:
-        """Pick a random template for the given situation."""
+                         interview_topic: Optional[str],
+                         language: str = "en") -> str:
+        """Pick a random template for the given situation and language."""
+        cfg = _get_lang(language)
+        greetings = cfg.get("greetings", _get_lang(_DEFAULT_LANG).get("greetings", []))
         if name == "someone":
-            return "Hello there!"
+            return random.choice(greetings).format(name=name) if greetings else f"Hello {name}!"
         if interview_topic:
-            options = _INTERVIEW_GREETINGS.get(interview_topic)
+            interview = cfg.get("interview", {})
+            options = interview.get(interview_topic)
+            if not options:
+                options = _get_lang(_DEFAULT_LANG).get("interview", {}).get(interview_topic)
             if options:
                 return random.choice(options).format(name=name)
-        return random.choice(_PLAIN_GREETINGS).format(name=name)
+        return random.choice(greetings).format(name=name) if greetings else f"Hello {name}!"
 
     def generate_response(self, memory: PeopleMemory, track_id: Optional[int],
                           heard_text: str, language: str = "en") -> str:
@@ -349,9 +353,11 @@ If nothing new, say "Nothing new." """
             result = await agent.run(prompt, deps=deps)
             return result.output.strip()
 
-    def generate_ask_name(self, track_id: int) -> str:
+    def generate_ask_name(self, track_id: int, language: str = "en") -> str:
         """Return a random 'what's your name?' prompt. Always canned."""
-        return random.choice(_ASK_NAME_PROMPTS)
+        cfg = _get_lang(language)
+        prompts = cfg.get("ask_name", _get_lang(_DEFAULT_LANG).get("ask_name", []))
+        return random.choice(prompts) if prompts else "Hello! What's your name?"
 
     def extract_name(self, person_said: str) -> Optional[str]:
         """Extract a personal name from speech via the LLM.

@@ -1,0 +1,249 @@
+# Language configuration for the Face Agent.
+#
+# Each [languages.<code>] section defines a supported language:
+#   tts_model  — Piper voice model name (downloaded automatically)
+#   greetings  — Plain greetings ({name} is replaced)
+#   goodbyes   — Farewell phrases ({name} is replaced)
+#   ask_name   — Prompts for asking an unknown person's name
+#
+# Interview greetings live under [languages.<code>.interview.<topic>].
+# Supported topics: favourite_colour, hobby, favourite_food, favourite_music
+#
+# The default language (used when none is detected) is set below.
+
+default = "en"
+
+# ── English ──────────────────────────────────────────────────────────
+
+[languages.en]
+tts_model = "en_US-lessac-medium"
+
+greetings = [
+    "Hello, {name}!",
+    "Hi {name}!",
+    "Hey {name}, good to see you!",
+    "Welcome back, {name}!",
+    "Hi again, {name}!",
+]
+
+goodbyes = [
+    "Goodbye, {name}!",
+    "See you later, {name}!",
+    "Bye {name}!",
+]
+
+ask_name = [
+    "Hello! What's your name?",
+    "Hi there, I don't think we've met — what should I call you?",
+    "Hey! What's your name?",
+]
+
+[languages.en.interview]
+favourite_colour = [
+    "Hi {name}! What's your favourite colour?",
+    "Hey {name}, what colour do you like best?",
+    "Hello {name}! Got a favourite colour?",
+]
+hobby = [
+    "Hi {name}! What do you like doing for fun?",
+    "Hey {name}, got any hobbies you enjoy?",
+    "Hello {name}! What do you do in your spare time?",
+]
+favourite_food = [
+    "Hi {name}! What's your favourite food?",
+    "Hey {name}, what do you love to eat?",
+    "Hello {name}! Got a favourite dish?",
+]
+favourite_music = [
+    "Hi {name}! What music are you into?",
+    "Hey {name}, any favourite artists these days?",
+    "Hello {name}! What do you like listening to?",
+]
+
+# ── Swedish ──────────────────────────────────────────────────────────
+
+[languages.sv]
+tts_model = "sv_SE-lisa-medium"
+
+greetings = [
+    "Hej {name}!",
+    "Hejsan {name}!",
+    "Hej {name}, kul att se dig!",
+    "Välkommen tillbaka, {name}!",
+    "Hej igen, {name}!",
+]
+
+goodbyes = [
+    "Hejdå, {name}!",
+    "Vi ses, {name}!",
+    "Hejdå {name}, ha det bra!",
+]
+
+ask_name = [
+    "Hej! Vad heter du?",
+    "Hejsan, jag tror inte vi har träffats — vad heter du?",
+    "Hej! Vad ska jag kalla dig?",
+]
+
+[languages.sv.interview]
+favourite_colour = [
+    "Hej {name}! Vilken är din favoritfärg?",
+    "Hejsan {name}, vilken färg gillar du bäst?",
+    "Hej {name}! Har du en favoritfärg?",
+]
+hobby = [
+    "Hej {name}! Vad gillar du att göra på fritiden?",
+    "Hejsan {name}, har du några hobbyer?",
+    "Hej {name}! Vad gör du på lediga stunder?",
+]
+favourite_food = [
+    "Hej {name}! Vad är din favoriträtt?",
+    "Hejsan {name}, vad gillar du att äta?",
+    "Hej {name}! Har du en favoriträtt?",
+]
+favourite_music = [
+    "Hej {name}! Vad lyssnar du på för musik?",
+    "Hejsan {name}, har du några favoritartister?",
+    "Hej {name}! Vad gillar du att lyssna på?",
+]
+
+# ── French ───────────────────────────────────────────────────────────
+
+[languages.fr]
+tts_model = "fr_FR-siwis-medium"
+
+greetings = [
+    "Bonjour {name} !",
+    "Salut {name} !",
+    "Hey {name}, content de te voir !",
+    "Re-bonjour {name} !",
+    "Salut {name}, ça fait plaisir !",
+]
+
+goodbyes = [
+    "Au revoir, {name} !",
+    "À bientôt, {name} !",
+    "Salut {name}, à plus !",
+]
+
+ask_name = [
+    "Bonjour ! Comment tu t'appelles ?",
+    "Salut, je ne crois pas qu'on se connaît — comment tu t'appelles ?",
+    "Hey ! Quel est ton prénom ?",
+]
+
+[languages.fr.interview]
+favourite_colour = [
+    "Salut {name} ! Quelle est ta couleur préférée ?",
+    "Hey {name}, tu préfères quelle couleur ?",
+    "Bonjour {name} ! Tu as une couleur préférée ?",
+]
+hobby = [
+    "Salut {name} ! Qu'est-ce que tu aimes faire pour t'amuser ?",
+    "Hey {name}, tu as des loisirs ?",
+    "Bonjour {name} ! Tu fais quoi pendant ton temps libre ?",
+]
+favourite_food = [
+    "Salut {name} ! Quel est ton plat préféré ?",
+    "Hey {name}, qu'est-ce que tu adores manger ?",
+    "Bonjour {name} ! Tu as un plat préféré ?",
+]
+favourite_music = [
+    "Salut {name} ! Tu écoutes quoi comme musique ?",
+    "Hey {name}, tu as des artistes préférés ?",
+    "Bonjour {name} ! Qu'est-ce que tu aimes écouter ?",
+]
+
+# ── Spanish ──────────────────────────────────────────────────────────
+
+[languages.es]
+tts_model = "es_ES-davefx-medium"
+
+greetings = [
+    "¡Hola {name}!",
+    "¡Hey {name}!",
+    "¡Qué tal {name}, me alegro de verte!",
+    "¡Bienvenido de nuevo, {name}!",
+    "¡Hola otra vez, {name}!",
+]
+
+goodbyes = [
+    "¡Adiós, {name}!",
+    "¡Hasta luego, {name}!",
+    "¡Nos vemos, {name}!",
+]
+
+ask_name = [
+    "¡Hola! ¿Cómo te llamas?",
+    "¡Hola, no creo que nos conozcamos! ¿Cómo te llamas?",
+    "¡Hey! ¿Cuál es tu nombre?",
+]
+
+[languages.es.interview]
+favourite_colour = [
+    "¡Hola {name}! ¿Cuál es tu color favorito?",
+    "¡Hey {name}, qué color te gusta más?",
+    "¡Hola {name}! ¿Tienes un color favorito?",
+]
+hobby = [
+    "¡Hola {name}! ¿Qué te gusta hacer en tu tiempo libre?",
+    "¡Hey {name}, tienes algún hobby?",
+    "¡Hola {name}! ¿Qué haces para divertirte?",
+]
+favourite_food = [
+    "¡Hola {name}! ¿Cuál es tu comida favorita?",
+    "¡Hey {name}, qué te encanta comer?",
+    "¡Hola {name}! ¿Tienes un plato favorito?",
+]
+favourite_music = [
+    "¡Hola {name}! ¿Qué música te gusta?",
+    "¡Hey {name}, tienes algún artista favorito?",
+    "¡Hola {name}! ¿Qué te gusta escuchar?",
+]
+
+# ── German ───────────────────────────────────────────────────────────
+
+[languages.de]
+tts_model = "de_DE-thorsten-medium"
+
+greetings = [
+    "Hallo {name}!",
+    "Hi {name}!",
+    "Hey {name}, schön dich zu sehen!",
+    "Willkommen zurück, {name}!",
+    "Hallo nochmal, {name}!",
+]
+
+goodbyes = [
+    "Tschüss, {name}!",
+    "Bis bald, {name}!",
+    "Auf Wiedersehen, {name}!",
+]
+
+ask_name = [
+    "Hallo! Wie heißt du?",
+    "Hi, ich glaube wir kennen uns noch nicht — wie heißt du?",
+    "Hey! Wie ist dein Name?",
+]
+
+[languages.de.interview]
+favourite_colour = [
+    "Hi {name}! Was ist deine Lieblingsfarbe?",
+    "Hey {name}, welche Farbe magst du am liebsten?",
+    "Hallo {name}! Hast du eine Lieblingsfarbe?",
+]
+hobby = [
+    "Hi {name}! Was machst du gerne in deiner Freizeit?",
+    "Hey {name}, hast du irgendwelche Hobbys?",
+    "Hallo {name}! Was machst du so in deiner freien Zeit?",
+]
+favourite_food = [
+    "Hi {name}! Was ist dein Lieblingsessen?",
+    "Hey {name}, was isst du am liebsten?",
+    "Hallo {name}! Hast du ein Lieblingsgericht?",
+]
+favourite_music = [
+    "Hi {name}! Was für Musik hörst du gerne?",
+    "Hey {name}, hast du Lieblingskünstler?",
+    "Hallo {name}! Was hörst du gerne?",
+]
