@@ -243,9 +243,10 @@ class Agent:
 
     # --- Manual actions ---
 
-    def speak(self, text: str):
+    def speak(self, text: str, language: str = None):
         """Speak text with WebRTC AEC barge-in support.
 
+        *language* selects the TTS voice (e.g. ``"fr"``, ``"de"``).
         Uses a full-duplex audio stream: TTS plays through speakers while
         the mic is processed by WebRTC's echo canceller. The echo-cancelled
         residual is monitored — if a human voice is detected, TTS stops.
@@ -255,17 +256,18 @@ class Agent:
         self._echo_detector = echo
 
         try:
-            if not self.voice_out.ready:
+            voice = self.voice_out._get_voice(language)
+            if voice is None:
                 logger.warning("[AGENT] TTS not ready, skipping speak")
                 return
 
             # Synthesize TTS audio and resample to mic rate for the
             # full-duplex stream
-            tts_sr = self.voice_out._piper_voice.config.sample_rate
+            tts_sr = voice.config.sample_rate
             stream_sr = echo._stream_rate
 
-            logger.info(f"[AGENT] synthesizing TTS: {text!r}")
-            for audio_chunk in self.voice_out._piper_voice.synthesize(text):
+            logger.info(f"[AGENT] synthesizing TTS ({language or 'default'}): {text!r}")
+            for audio_chunk in voice.synthesize(text):
                 raw = audio_chunk.audio_float_array
                 # Resample from TTS rate to stream rate if needed
                 if tts_sr != stream_sr:
@@ -389,7 +391,8 @@ class Agent:
         if self.voice_out.speaking or self._busy:
             logger.info(f"[AGENT] skipping goodbye speech (busy)")
             return
-        self.speak(text)
+        lang = person.last_language if person else None
+        self.speak(text, language=lang or None)
 
     # --- Periodic check for unknown faces (called from outside or a timer) ---
 
@@ -462,7 +465,7 @@ class Agent:
             if tid:
                 self.memory.add_dialogue(tid, "system", response, language=lang)
             self.state = "TALKING"
-            self.speak(response)
+            self.speak(response, language=lang)
 
             # Background fact extraction — safety net in case tools didn't fire
             if tid and person and person.is_identified:
@@ -520,7 +523,8 @@ class Agent:
 
             self.memory.add_dialogue(track_id, "system", greeting)
             self.memory.update_seen(track_id, emotion)
-            self.speak(greeting)
+            lang = person.last_language if person else None
+            self.speak(greeting, language=lang or None)
             logger.info(f"[AGENT] _do_greet: done, resuming listener")
 
         finally:

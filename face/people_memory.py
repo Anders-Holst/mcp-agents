@@ -112,6 +112,14 @@ class Person:
             summary=d.get("summary", ""),
         )
 
+    @property
+    def last_language(self) -> str:
+        """Language from the most recent dialogue entry that has one, or ''."""
+        for d in reversed(self.dialogues):
+            if d.language:
+                return d.language
+        return ""
+
     def missing_topics(self) -> list[str]:
         """Interview topics we haven't asked this person about yet."""
         return [t for t in INTERVIEW_TOPICS if t not in self.asked_topics]

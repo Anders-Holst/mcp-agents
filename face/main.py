@@ -541,7 +541,7 @@ def main():
                             reply = llm.generate_response(memory, track_id, response, language=lang)
                             if track_id:
                                 memory.add_dialogue(track_id, "system", reply, language=lang)
-                            agent.speak(reply)
+                            agent.speak(reply, language=lang)
                         agent.resume_listening()
                     threading.Thread(target=_do_talk, daemon=True).start()
 
