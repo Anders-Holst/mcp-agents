@@ -11,6 +11,7 @@ Can be run standalone:
     python voice_output.py --interactive
 """
 
+import collections
 import os
 import time
 import threading
@@ -30,6 +31,16 @@ logger = logging.getLogger("voice_output")
 
 PIPER_MODEL_DIR = "piper_models"
 PIPER_MODEL_NAME = "en_US-lessac-medium"
+
+# Language code -> piper model name
+LANGUAGE_MODELS = {
+    "en": "en_US-lessac-medium",
+    "fr": "fr_FR-siwis-medium",
+    "sv": "sv_SE-nst-medium",
+    "es": "es_ES-davefx-medium",
+    "de": "de_DE-thorsten-medium",
+}
+DEFAULT_LANGUAGE = "en"
 
 
 def _piper_download_url(model_name: str) -> str:
@@ -118,10 +129,14 @@ class VoiceOutput:
 
     def __init__(self, *,
                  model_dir: str = PIPER_MODEL_DIR,
-                 model_name: str = PIPER_MODEL_NAME):
+                 model_name: str = PIPER_MODEL_NAME,
+                 language_models: Optional[dict] = None):
         self._model_dir = model_dir
-        self._model_name = model_name
-        self._piper_voice = None
+        self._default_model = model_name
+        self._language_models = dict(language_models or LANGUAGE_MODELS)
+        # Loaded PiperVoice instances keyed by model name
+        self._voices: dict[str, PiperVoice] = {}
+        self._model_lock = threading.Lock()  # protects _voices lazy loading
         self._ready = False
         self._speaking = False
         self._stop_event = threading.Event()
@@ -146,6 +161,10 @@ class VoiceOutput:
     def speaking(self) -> bool:
         return self._speaking
 
+    @speaking.setter
+    def speaking(self, value: bool):
+        self._speaking = value
+
     # --- Lifecycle ---
 
     def load(self):
@@ -157,35 +176,57 @@ class VoiceOutput:
         self._load()
 
     def _load(self):
-        self._emit(TtsEventType.MODEL_LOADING,
-                   ModelLoadingPayload(self._model_name))
-        try:
-            self._ensure_model()
-            model_path = os.path.join(self._model_dir, f"{self._model_name}.onnx")
-            logger.info(f"Loading piper model: {self._model_name}...")
-            self._piper_voice = PiperVoice.load(model_path)
-            self._ready = True
-            self._emit(TtsEventType.MODEL_READY,
-                       ModelReadyPayload(self._model_name))
-            logger.info("Piper TTS loaded.")
-        except Exception as e:
-            self._emit(TtsEventType.MODEL_LOAD_FAILED,
-                       ModelLoadFailedPayload(self._model_name, str(e)))
-            logger.error(f"Failed to load piper: {e}")
+        """Load the default model so the engine is ready quickly."""
+        self._load_model(self._default_model)
 
-    def _ensure_model(self):
+    def _load_model(self, model_name: str):
+        """Load a single piper model by name (downloads if needed).
+
+        Thread-safe: uses _model_lock to prevent duplicate loads.
+        """
+        with self._model_lock:
+            if model_name in self._voices:
+                return
+            self._emit(TtsEventType.MODEL_LOADING,
+                       ModelLoadingPayload(model_name))
+            try:
+                self._ensure_model(model_name)
+                model_path = os.path.join(self._model_dir, f"{model_name}.onnx")
+                logger.info(f"Loading piper model: {model_name}...")
+                self._voices[model_name] = PiperVoice.load(model_path)
+                self._ready = True
+                self._emit(TtsEventType.MODEL_READY,
+                           ModelReadyPayload(model_name))
+                logger.info(f"Piper TTS loaded: {model_name}")
+            except Exception as e:
+                self._emit(TtsEventType.MODEL_LOAD_FAILED,
+                           ModelLoadFailedPayload(model_name, str(e)))
+                logger.error(f"Failed to load piper model {model_name}: {e}")
+
+    def _ensure_model(self, model_name: str):
         os.makedirs(self._model_dir, exist_ok=True)
-        model_path = os.path.join(self._model_dir, f"{self._model_name}.onnx")
+        model_path = os.path.join(self._model_dir, f"{model_name}.onnx")
         config_path = model_path + ".json"
         if not os.path.exists(model_path):
             import urllib.request
-            base_url = _piper_download_url(self._model_name)
-            logger.info(f"Downloading piper model: {self._model_name}...")
+            base_url = _piper_download_url(model_name)
+            logger.info(f"Downloading piper model: {model_name}...")
             urllib.request.urlretrieve(
-                base_url + f"{self._model_name}.onnx", model_path)
+                base_url + f"{model_name}.onnx", model_path)
             urllib.request.urlretrieve(
-                base_url + f"{self._model_name}.onnx.json", config_path)
+                base_url + f"{model_name}.onnx.json", config_path)
             logger.info("Piper model downloaded.")
+
+    def _get_voice(self, language: Optional[str] = None) -> PiperVoice:
+        """Return the PiperVoice for a language, lazy-loading if needed."""
+        model_name = self._language_models.get(
+            language, self._default_model) if language else self._default_model
+        if model_name not in self._voices:
+            self._load_model(model_name)
+        # Fall back to default if the requested model failed to load
+        if model_name not in self._voices:
+            model_name = self._default_model
+        return self._voices[model_name]
 
     # --- Core ---
 
@@ -198,28 +239,30 @@ class VoiceOutput:
         """Interrupt the current TTS playback. Safe to call from any thread."""
         self._stop_event.set()
 
-    def speak(self, text: str):
+    def speak(self, text: str, language: Optional[str] = None):
         """Blocking TTS: synthesize and play. Thread-safe.
 
+        *language* selects the voice model (e.g. ``"fr"``, ``"de"``).
+        Falls back to the default (English) if the language is unknown.
         Can be interrupted mid-playback via ``stop_speaking()``.
         After returning, check ``interrupted`` to know if it was cut short.
         """
-        if not self._ready:
-            logger.warning(f"TTS not ready, would say: {text}")
-            return
-
         if not self._lock.acquire(timeout=0.5):
             self._emit(TtsEventType.TTS_BUSY, TtsBusyPayload(text))
             logger.warning(f"TTS busy, rejected: {text}")
             return
 
         try:
+            voice = self._get_voice(language)
+            if voice is None:
+                logger.warning(f"TTS not ready, would say: {text}")
+                return
             self._speaking = True
             self._interrupted = False
             self._stop_event.clear()
             start = time.time()
             self._emit(TtsEventType.TTS_STARTED, TtsStartedPayload(text))
-            self._play(text)
+            self._play(text, voice)
             duration = time.time() - start
             self._emit(TtsEventType.TTS_FINISHED,
                        TtsFinishedPayload(text, duration))
@@ -227,13 +270,14 @@ class VoiceOutput:
             self._speaking = False
             self._lock.release()
 
-    def speak_async(self, text: str):
+    def speak_async(self, text: str, language: Optional[str] = None):
         """Non-blocking TTS: speak in a background thread."""
-        threading.Thread(target=self.speak, args=(text,), daemon=True).start()
+        threading.Thread(target=self.speak, args=(text, language),
+                         daemon=True).start()
 
-    def _play(self, text: str):
-        sr = self._piper_voice.config.sample_rate
-        buffer = []
+    def _play(self, text: str, voice: PiperVoice):
+        sr = voice.config.sample_rate
+        buffer = collections.deque()
         finished = threading.Event()
         stop = self._stop_event
 
@@ -242,14 +286,14 @@ class VoiceOutput:
                 outdata[:, 0] = 0
                 raise sd.CallbackStop
             if buffer:
-                chunk = buffer.pop(0)
+                chunk = buffer.popleft()
                 if len(chunk) < frames:
                     outdata[:len(chunk), 0] = chunk
                     outdata[len(chunk):, 0] = 0
                 else:
                     outdata[:, 0] = chunk[:frames]
                     if len(chunk) > frames:
-                        buffer.insert(0, chunk[frames:])
+                        buffer.appendleft(chunk[frames:])
             else:
                 outdata[:, 0] = 0
                 if finished.is_set():
@@ -260,7 +304,7 @@ class VoiceOutput:
             blocksize=4096, callback=callback,
         )
         stream.start()
-        for audio_chunk in self._piper_voice.synthesize(text):
+        for audio_chunk in voice.synthesize(text):
             if stop.is_set():
                 break
             buffer.append(audio_chunk.audio_float_array)
