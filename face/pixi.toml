@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "face-recognition"
 version = "0.1.0"
 description = "Face recognition app that learns faces over time"
