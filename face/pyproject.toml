@@ -2,7 +2,7 @@
 name = "face-agent"
 version = "0.1.0"
 description = "Face recognition app that learns faces over time"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.13"
 
 dependencies = [
     "dlib",
