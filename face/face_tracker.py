@@ -37,7 +37,10 @@ from events import EventDispatcher
 
 logger = logging.getLogger("face_tracker")
 
-EMOTION_MODEL_DIR = "emotion_model"
+_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+EMOTION_MODEL_DIR = os.path.join(_SOURCE_DIR, "emotion_model")
+_KNOWN_FACES_DIR = os.path.join(_SOURCE_DIR, "known_faces")
 EMOTION_MODEL_URL = "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/emotion_ferplus/model/emotion-ferplus-8.onnx"
 EMOTION_LABELS = ["neutral", "happy", "surprise", "sad", "angry", "disgust", "fear", "contempt"]
 
@@ -203,7 +206,7 @@ class FaceDatabase:
 
     SCHEMA_VERSION = 2
 
-    def __init__(self, db_dir: str = "known_faces", tolerance: float = 0.6):
+    def __init__(self, db_dir: str = _KNOWN_FACES_DIR, tolerance: float = 0.6):
         self.db_dir = db_dir
         self.tolerance = tolerance
         self._db = {

@@ -164,7 +164,11 @@ class PeopleMemory:
     the JSON and can be changed freely without touching the ID.
     """
 
-    def __init__(self, storage_dir: str = "people"):
+    _DEFAULT_DIR = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "people"
+    )
+
+    def __init__(self, storage_dir: str = _DEFAULT_DIR):
         self._dir = storage_dir
         # Active session: track_id -> Person
         self._active: dict[int, Person] = {}

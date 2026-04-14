@@ -29,7 +29,9 @@ from events import EventDispatcher
 
 logger = logging.getLogger("voice_output")
 
-PIPER_MODEL_DIR = "piper_models"
+_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+PIPER_MODEL_DIR = os.path.join(_SOURCE_DIR, "piper_models")
 PIPER_MODEL_NAME = "en_US-lessac-medium"
 
 # Language models loaded from languages.toml (with hardcoded fallback)
