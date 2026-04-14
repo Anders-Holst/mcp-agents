@@ -1,0 +1,27 @@
+[project]
+name = "face-agent"
+version = "0.1.0"
+description = "Face recognition app that learns faces over time"
+requires-python = ">=3.11,<3.13"
+
+dependencies = [
+    "dlib",
+    "numpy",
+    "face-recognition>=1.3.0",
+    "face-recognition-models",
+    "setuptools<80",
+    "sounddevice",
+    "scipy",
+    "opencv-python>=4.13.0,<5",
+    "piper-tts",
+    "faster-whisper",
+    "onnxruntime>=1.23.2,<2",
+    "torch",
+    "torchaudio",
+    "noisereduce",
+    "pydantic-ai",
+    "livekit>=1.1.5,<2",
+]
+
+# Run scripts with: uv run python <script>.py
+# e.g. uv run python agent.py --shell
