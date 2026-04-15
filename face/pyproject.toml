@@ -23,5 +23,9 @@ dependencies = [
     "livekit>=1.1.5,<2",
 ]
 
+[project.scripts]
+face-tracker = "face_tracker:main"
+
 # Run scripts with: uv run python <script>.py
 # e.g. uv run python agent.py --shell
+# Standalone tracker: uv run face-tracker
