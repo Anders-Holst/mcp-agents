@@ -1,3 +1,4 @@
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from colorwidgets import gray, CCText, CCWidget
@@ -60,9 +61,15 @@ class EyeWindow:
         self.win = WindowMgr(name, self.width, self.height, 1, 1)
         self.bg = gray(0.5)
         self.eye = ColorEye(self.win.fig, (0.1, 0.05, 0.8, 0.8), self.bg)
-        self.txt0 = CCText(self.win.fig, (0.5, 0.9), name, 1.0/20) 
+        self.txt0 = CCText(self.win.fig, (0.5, 0.9), name, 1.0/20)
         self.txt1 = CCText(self.win.fig, (0.5, 0.45), "", 1.0/20)
         self.txt2 = CCText(self.win.fig, (0.5, 0.38), "", 1.0/40)
+        self.cam_ax = self.win.fig.add_axes((0.78, 0.80, 0.20, 0.18))
+        self.cam_ax.set_xticks([]); self.cam_ax.set_yticks([])
+        for s in self.cam_ax.spines.values():
+            s.set_visible(False)
+        self.cam_im = self.cam_ax.imshow(np.zeros((2, 2, 3), dtype=np.uint8))
+        self._pending_frame = None
         self.win.set_background(self.bg)
         self.win.register_target((0.15, 0.1, 0.7, 0.7), self)
         self.win.add_resize_callback(self.resize)
@@ -122,6 +129,16 @@ class EyeWindow:
         if self.func2:
             self.func2(event, self.obj)
 
+    def set_camera_frame(self, frame_rgb):
+        self._pending_frame = frame_rgb
+
     def check_events(self):
+        frame = self._pending_frame
+        if frame is not None:
+            self._pending_frame = None
+            self.cam_im.set_data(frame)
+            if frame.shape[:2] != self.cam_im.get_array().shape[:2]:
+                self.cam_ax.set_xlim(-0.5, frame.shape[1] - 0.5)
+                self.cam_ax.set_ylim(frame.shape[0] - 0.5, -0.5)
         self.win.fig.canvas.flush_events()
 
