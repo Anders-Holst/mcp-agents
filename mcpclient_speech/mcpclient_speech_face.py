@@ -40,6 +40,7 @@ ollama_config = {
     "api_key": "ollama"
 }
 
+default_lang = "sv"
 messages_trunclen = 8
 messages = []
 state = {'evtime': 0, 'statetime': 0, 'newstate': None, 'currstate': None}
@@ -55,7 +56,7 @@ has_exit = False
 class Person:
     def __init__(self, name):
         self.name = name
-        self.lang = "en"
+        self.lang = default_lang
         self.lasttime = None
         self.lastmessages = []
         self.profileinfo = None
@@ -432,9 +433,9 @@ async def main():
 
         ### Main loop 
 
-        lang = False
+        lang = default_lang
         prompt = ""
-        txtlang = 'en'
+        txtlang = default_lang
         langprompt = False
         sysprompt = False
         augprompt = False
@@ -492,6 +493,12 @@ async def main():
                         if voice_in and voice_in.detected_language:
                             lang = voice_in.detected_language
                         curr_prompt = ""
+
+                if newstate == 'greet':
+                    if curr_person and curr_person.lang and curr_person.lang in ['en','sv','de','fr','es']:
+                        lang = curr_person.lang
+                    else:
+                        lang = default_lang
 
                 langprompt = language_message(lang)
                 sysprompt = await system_message(client, lang)
