@@ -81,6 +81,7 @@ def scene_message(scene, lang):
 @mcp.prompt()
 def get_service_augmentation(lang: str) -> Message:
     """Return extra information on the current state, to insert before the user prompt"""
+    camera_check_event()
     scene = acquire_scene()
     return Message(scene_message(scene, lang))
 

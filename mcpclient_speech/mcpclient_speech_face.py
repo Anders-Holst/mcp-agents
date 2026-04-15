@@ -568,9 +568,8 @@ async def main():
                     listener.paused = True
                     #voice_out.speak(reply_text, lang)
                     speak(reply_text, lang)
-                    print("(Done speaking???")
-                    listener.paused = False
-                set_state(state, 'listen')
+                if state['newstate'] is None or state['newstate']=='listen':
+                    set_state(state, 'listen')
 
                 newstate = False
     

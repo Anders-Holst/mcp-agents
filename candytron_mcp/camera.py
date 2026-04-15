@@ -11,7 +11,7 @@ def init_cam(use_camera=True):
         return True
     global capture, yolomodel
     yolomodel = YOLO('models/best-m.pt')
-    capture = cv2.VideoCapture(0)
+    capture = cv2.VideoCapture(2)
     if not capture.isOpened():
         return False
     return True
