@@ -126,17 +126,20 @@ def on_face_change(id):
     if curr_person:
         print("(Storing current person)")
         curr_person.lasttime = time.time()
-        curr_person.lastmessages = messages
-        info = distill_user_info(extract_dialog_messages(messages))
-        name = extract_value("Name:", info)
-        if name:
-            curr_person.name = name
-        lang = extract_language(info)
-        if lang:
-            curr_person.lang = lang
-        pref = extract_value("Preferences:", info)
-        if pref:
-            curr_person.profileinfo = pref
+        if curr_person.lastmessages is not messages: # Does this work? I try to see if anything new has been said, otherwise there is no point extracting again. If there are many switches between people.
+            curr_person.lastmessages = messages
+            info = distill_user_info(extract_dialog_messages(messages))
+            name = extract_value("Name:", info)
+            if name:
+                curr_person.name = name
+            lang = extract_language(info)
+            if lang:
+                curr_person.lang = lang
+            pref = extract_value("Preferences:", info)
+            if pref:
+                curr_person.profileinfo = pref
+        else:
+            print("(Nothing new to extract)")
     if id is None:
         messages = []
         curr_person = None
@@ -153,7 +156,10 @@ def on_face_change(id):
             messages = []
             print(f"(Creating person {id})")
         state['evtime'] = time.time()
-        state['newstate'] = 'greet'
+        if state['evtime'] - curr_person.lasttime < 60:
+            state['newstate'] = 'listen'
+        else:
+            state['newstate'] = 'greet'
 
 def on_speech(txt):
     global curr_prompt, state
@@ -246,12 +252,16 @@ def language_message(lang):
     return {"role": "system", "content": msg}
 
 def greet_prompt():
-    if not curr_person.name:
+    if not curr_person.name and not curr_person.lasttime:
         return {'role':'user', 'content':'There is a new person in front of you. Produce a greeting and ask for the name.'}
-    if curr_person.lasttime is None:
+    if curr_person.lasttime is None: # This alternative was added by Claude but it should actually never happen
         return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. Produce a suitable greeting.'}
     duration = int((time.time() - curr_person.lasttime) / 60)
-    return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. {("Known preferences: " + curr_person.preferences if curr_person.preferences else "")} It was {duration} minutes since you last met. Produce a suitable greeting.'}
+    pref = ("Known preferences: " + curr_person.preferences) if curr_person.preferences else ""
+    if not curr_person.name:
+        return {'role':'user', 'content': f'A person has appeared in front of you. {pref} It was {duration} minutes since you last met, but you still dont know the name. Produce a suitable greeting and ask for the name.'}
+    else:
+        return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. {pref} It was {duration} minutes since you last met. Produce a suitable greeting.'}
 
 def compose_messages(sysp, mlst, augs):
     n = 0
