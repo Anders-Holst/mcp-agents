@@ -4,6 +4,7 @@ from fastmcp import FastMCP
 from fastmcp.prompts import Message
 import argparse
 import random
+import time
 
 from camera import *
 from robotarm import *
@@ -25,28 +26,28 @@ def service_init() -> bool:
     init_ned(use_robot=use_robot)
     print('Initialized robot arm: Niryo Ned 2')
 
-    if init_cam(use_camera=use_camera):
-        print('Initialized camera and YOLO model')
-    else:
-        print('ERROR: failed to initialize camera and YOLO model')
-        return False
+#    if init_cam(use_camera=use_camera):
+#        print('Initialized camera and YOLO model')
+#    else:
+#        print('ERROR: failed to initialize camera and YOLO model')
+#        return False
 
-    cal = False
-    for i in range(0, 10):
-        if calibrate_positions(3, 4):
-            cal = True
-            break
-    if not cal:
-        print("Failed to calibrate positions from camera - make sure the area is visible and put one candy in each corner, and try again.")
-        exit_cam()
-        return False
+#    cal = False
+#    for i in range(0, 10):
+#        if calibrate_positions(3, 4):
+#            cal = True
+#            break
+#    if not cal:
+#        print("Failed to calibrate positions from camera - make sure the area is visible and put one candy in each corner, and try again.")
+#        exit_cam()
+#        return False
     return True
 
 @mcp.resource("url://service_exit")
 def service_exit() -> bool:
     """Clean up after the service. Is called when the current client is shutting down."""
     exit_ned()
-    exit_cam()
+#    exit_cam()
     print('Exiting ned2 and camera')
     return True
 
@@ -122,6 +123,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
     use_robot = not args.simulate_robot
     use_camera = not args.simulate_camera
+    if init_cam(use_camera=use_camera):
+        print('Initialized camera and YOLO model')
+    else:
+        print('ERROR: failed to initialize camera and YOLO model')
+    cal = False
+    for i in range(0, 100):
+        time.sleep(1)
+        if calibrate_positions(3, 4):
+            cal = True
+            break
+        camera_check_event()
     if args.transport != "stdio":
         mcp.run(transport=args.transport, host=args.host, port=args.port)
     else:

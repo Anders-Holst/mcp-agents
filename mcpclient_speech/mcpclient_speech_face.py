@@ -377,6 +377,7 @@ async def main():
             return False
         listener = ContinuousListener(voice_in)
         listener.start()
+        listener.paused = True
         print('Continuous listener started')
 
         ### Initialize voice_output (piper TTS)
@@ -401,7 +402,7 @@ async def main():
                           event_types={FaceEventType.FOCUS_CHANGED})
 
         def _camera_loop():
-            cap = cv2.VideoCapture(0)
+            cap = cv2.VideoCapture(4)
             if not cap.isOpened():
                 print('Could not open camera 0')
                 return
@@ -510,7 +511,7 @@ async def main():
                     messages.append(greetprompt)
 
                 msg = compose_messages(sysprompt, messages, augpromptlist)
-                messagedump(msg)
+                #messagedump(msg)
                 response = openai.chat.completions.create(
                     model=model,
                     messages=msg,
@@ -550,7 +551,7 @@ async def main():
                             messages.append(result_message)
     
                     msg = compose_messages(sysprompt, messages, augpromptlist)
-                    messagedump(msg)
+                    #messagedump(msg)
                     response = openai.chat.completions.create(
                         model=model,
                         messages=msg,
@@ -564,8 +565,11 @@ async def main():
                 print(f'\n  Response: {reply_text}  (lang={lang})')
                 set_win_state('talk')
                 if reply_text:
+                    listener.paused = True
                     #voice_out.speak(reply_text, lang)
                     speak(reply_text, lang)
+                    print("(Done speaking???")
+                    listener.paused = False
                 set_state(state, 'listen')
 
                 newstate = False
