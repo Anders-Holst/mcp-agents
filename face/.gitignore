@@ -2,3 +2,8 @@ known_faces/
 piper_models/
 emotion_model/
 .pixi/
+
+# Runtime data and backups
+people/
+logs/
+*.backup_*/
