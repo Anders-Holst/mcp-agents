@@ -342,7 +342,13 @@ If nothing new was revealed, say "Nothing new." """
                 "- Call replace_fact when a fact updates or contradicts an "
                 "existing one.\n"
                 "- Call set_name if they state or correct their name.\n"
-                "- If nothing new was said, do NOT call any tools."
+                "- If nothing new was said, do NOT call any tools.\n\n"
+                "Fact formatting — VERY IMPORTANT:\n"
+                "- Write facts as bare predicates with NO subject.\n"
+                "- GOOD: 'likes chess', 'is a musician', 'mentioned a hotel'.\n"
+                "- BAD:  'Joakim likes chess', 'The person is a musician', "
+                "'He mentioned a hotel'.\n"
+                "- Do not add a trailing period. Keep it short."
             ),
             deps_type=ConversationDeps,
             toolsets=self._mcp_servers,
@@ -350,7 +356,13 @@ If nothing new was revealed, say "Nothing new." """
 
         @agent.tool
         def write_fact(ctx: RunContext[ConversationDeps], fact: str) -> str:
-            """Remember a personal fact about the person. Always write the fact in English, translating if needed."""
+            """Remember a personal fact about the person.
+
+            Always write the fact in English (translating if needed) and as a
+            BARE PREDICATE — no subject, no name, no pronoun. For example:
+            write 'likes chess', not 'Joakim likes chess' or 'He likes chess'.
+            Storage will auto-strip subjects, but keep the input clean.
+            """
             logger.info(f"[TOOL:write_fact] {fact}")
             ctx.deps.memory.add_fact(ctx.deps.track_id, fact)
             return "Stored."

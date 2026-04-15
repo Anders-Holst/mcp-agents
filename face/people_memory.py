@@ -30,6 +30,8 @@ logger = logging.getLogger("people_memory")
 # they say in response is captured by ``extract_facts`` like everything
 # else — there's no separate slot storage anymore.
 INTERVIEW_TOPICS: list[str] = [
+    "favourite_candy",
+    "favourite_coffee",
     "favourite_colour",
     "hobby",
     "favourite_food",
@@ -154,6 +156,64 @@ class Person:
 
 
 _PERSON_ID_RE = re.compile(r"^p(\d+)$")
+
+
+# ---------------------------------------------------------------------------
+# Fact normalization and similarity
+# ---------------------------------------------------------------------------
+
+_SUBJECT_PRONOUN_RE = re.compile(r"^(the\s+person|he|she|they)\s+", re.IGNORECASE)
+
+# Words ignored in token-set comparisons so that "likes chess" and
+# "likes the game of chess" still compare as dupes.
+_STOPWORDS = {
+    "a", "an", "the", "is", "was", "are", "were", "am", "be", "been", "being",
+    "has", "have", "had", "does", "did", "do", "that", "this", "these", "those",
+    "with", "and", "or", "of", "in", "on", "to", "for", "at", "by", "as",
+    "his", "her", "their", "its", "my", "your",
+    "mentioned", "said", "says", "stated",
+}
+
+
+def _strip_subject(fact: str, person_name: Optional[str]) -> str:
+    """Normalize a fact to bare-predicate form: strip leading subject.
+
+    "Joakim likes lingonsylt" -> "likes lingonsylt"
+    "The person mentioned a hotel" -> "mentioned a hotel"
+    "Joakim's spare time activity is AI" -> "spare time activity is AI"
+    Also lowercases the first letter and strips a trailing period so that
+    variants like "Likes X." and "likes X" collapse.
+    """
+    f = (fact or "").strip()
+    if not f:
+        return ""
+    if person_name:
+        # Possessive first: "Joakim's ..."
+        poss = re.compile(rf"^{re.escape(person_name)}'s\s+", re.IGNORECASE)
+        f = poss.sub("", f).strip()
+        # Plain subject: "Joakim ..."
+        plain = re.compile(rf"^{re.escape(person_name)}\s+", re.IGNORECASE)
+        f = plain.sub("", f).strip()
+    f = _SUBJECT_PRONOUN_RE.sub("", f).strip()
+    if not f:
+        return ""
+    f = f[0].lower() + f[1:]
+    return f.rstrip(".").strip()
+
+
+def _fact_tokens(s: str, extra_stops: Optional[set] = None) -> set:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\s']", " ", s)
+    stops = _STOPWORDS | (extra_stops or set())
+    return {w for w in s.split() if w and w not in stops and len(w) > 1}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
 
 
 class PeopleMemory:
@@ -360,51 +420,60 @@ class PeopleMemory:
             self._save(person)
 
     @staticmethod
-    def _fact_similar(a: str, b: str) -> bool:
-        """Check if two facts are similar enough to be duplicates.
+    def _fact_similar(a: str, b: str, person_name: Optional[str] = None) -> bool:
+        """True if two facts are near-duplicates.
 
-        Normalizes case, punctuation, and common prefixes like the
-        person's name, then checks if the shorter string is contained
-        in the longer one.
+        Uses token-set Jaccard (>= 0.75) plus a subset check for the case
+        where one fact is a condensed version of the other. ``person_name``
+        is added to the stopword set so that "Joakim likes lingonsylt" and
+        "likes lingonsylt" compare as duplicates even if one side still
+        has the subject.
         """
-        import re
-        def normalize(s):
-            s = s.lower().strip().rstrip(".")
-            # Strip leading name/pronoun patterns
-            s = re.sub(r"^(joakim|the person|he|she|they)\s+(is|likes?|has|was|mentioned)\s+", "", s)
-            s = re.sub(r"^(is|likes?|has|was|mentioned)\s+", "", s)
-            return s
-        na, nb = normalize(a), normalize(b)
-        if na == nb:
+        extra = set()
+        if person_name:
+            extra |= {t for t in person_name.lower().split() if len(t) > 1}
+        ta = _fact_tokens(a, extra)
+        tb = _fact_tokens(b, extra)
+        if not ta or not tb:
+            return a.strip().lower().rstrip(".") == b.strip().lower().rstrip(".")
+        if _jaccard(ta, tb) >= 0.75:
             return True
-        # Check containment
-        short, long = (na, nb) if len(na) <= len(nb) else (nb, na)
-        return len(short) > 5 and short in long
+        short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+        if len(short) >= 3 and short.issubset(long_):
+            return True
+        return False
 
     def add_fact(self, track_id: int, fact: str):
-        """Add a fact about a person (deduplicates by similarity)."""
+        """Add a fact about a person (strips subject, deduplicates by similarity)."""
         person = self.get_or_create(track_id)
+        normalized = _strip_subject(fact, person.name)
+        if not normalized:
+            return
         for existing in person.facts:
-            if self._fact_similar(fact, existing):
+            if self._fact_similar(normalized, existing, person.name):
                 logger.debug(f"Duplicate fact skipped for track {track_id}: "
-                             f"{fact!r} ~ {existing!r}")
+                             f"{normalized!r} ~ {existing!r}")
                 return
-        person.facts.append(fact)
-        logger.info(f"New fact about track {track_id} ({person.name or '?'}): {fact}")
+        person.facts.append(normalized)
+        logger.info(f"New fact about track {track_id} ({person.name or '?'}): {normalized}")
         if person.is_identified:
             self._save(person)
 
     def replace_fact(self, track_id: int, old_fact: str, new_fact: str):
-        """Replace an existing fact with an updated version."""
+        """Replace an existing fact with an updated version (normalized)."""
         person = self.get_or_create(track_id)
+        normalized = _strip_subject(new_fact, person.name)
+        if not normalized:
+            return
         try:
             idx = person.facts.index(old_fact)
-            person.facts[idx] = new_fact
+            person.facts[idx] = normalized
             logger.info(f"Replaced fact for track {track_id} ({person.name or '?'}): "
-                        f"{old_fact!r} -> {new_fact!r}")
+                        f"{old_fact!r} -> {normalized!r}")
         except ValueError:
-            person.facts.append(new_fact)
-            logger.info(f"New fact (replace miss) for track {track_id}: {new_fact}")
+            # Fall through to add_fact so dedup kicks in
+            self.add_fact(track_id, new_fact)
+            return
         if person.is_identified:
             self._save(person)
 
@@ -563,6 +632,153 @@ class PeopleMemory:
 
 
 # ---------------------------------------------------------------------------
+# Offline cleanup helpers (used by `dedupe` and `compress` CLI commands)
+# ---------------------------------------------------------------------------
+
+def _dedupe_person_facts(
+    facts: list[str], person_name: Optional[str]
+) -> tuple[list[str], list[tuple]]:
+    """Rule-based dedupe: strip subject, cluster by similarity, keep longest.
+
+    Returns (new_facts, changes) where changes is a list of tuples:
+      ("normalized", original, new)  — subject stripped
+      ("dropped",    victim,   kept) — merged into an earlier, longer fact
+      ("replaced",   old_kept, new)  — victim was longer; promoted over kept
+    """
+    changes: list[tuple] = []
+    normalized: list[str] = []
+    for f in facts:
+        stripped = _strip_subject(f, person_name)
+        if not stripped:
+            changes.append(("dropped", f, ""))
+            continue
+        if stripped != f:
+            changes.append(("normalized", f, stripped))
+        normalized.append(stripped)
+
+    kept: list[str] = []
+    for f in normalized:
+        merged = False
+        for i, k in enumerate(kept):
+            if PeopleMemory._fact_similar(f, k, person_name):
+                if len(f) > len(k):
+                    changes.append(("replaced", k, f))
+                    kept[i] = f
+                else:
+                    changes.append(("dropped", f, k))
+                merged = True
+                break
+        if not merged:
+            kept.append(f)
+    return kept, changes
+
+
+def _load_face_encodings_by_person(db_dir: str) -> dict:
+    """Load ``known_faces/faces.pkl`` and return {person_id: [encoding, ...]}."""
+    path = os.path.join(db_dir, "faces.pkl")
+    if not os.path.exists(path):
+        return {}
+    import pickle
+    with open(path, "rb") as fh:
+        db = pickle.load(fh)
+    out: dict = {}
+    for pid, enc in zip(db.get("person_ids", []), db.get("encodings", [])):
+        out.setdefault(pid, []).append(enc)
+    return out
+
+
+def _pair_face_distances(encs_a: list, encs_b: list) -> tuple[float, float]:
+    """Return (min, mean) L2 distance between two encoding sets.
+
+    ``(inf, inf)`` if either set is empty.
+    """
+    if not encs_a or not encs_b:
+        return float("inf"), float("inf")
+    import numpy as _np
+    A = _np.asarray(encs_a)
+    B = _np.asarray(encs_b)
+    # Pairwise L2: ||a-b|| for every a in A, b in B
+    diffs = A[:, None, :] - B[None, :, :]
+    d = _np.linalg.norm(diffs, axis=2)
+    return float(d.min()), float(d.mean())
+
+
+def _name_similarity(a: Optional[str], b: Optional[str]) -> float:
+    if not a or not b:
+        return 0.0
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def _facts_similarity(facts_a: list[str], facts_b: list[str]) -> float:
+    if not facts_a or not facts_b:
+        return 0.0
+    toks_a: set = set()
+    toks_b: set = set()
+    for f in facts_a:
+        toks_a |= _fact_tokens(f)
+    for f in facts_b:
+        toks_b |= _fact_tokens(f)
+    return _jaccard(toks_a, toks_b)
+
+
+def _similarity_verdict(face_min: float, name: float, facts: float) -> Optional[str]:
+    """Classify a pair. Returns a short label or None to hide."""
+    if face_min < 0.40:
+        return "LIKELY SAME"
+    if face_min < 0.55 and (name > 0.85 or facts > 0.30):
+        return "LIKELY SAME"
+    if face_min < 0.55:
+        return "maybe"
+    if name > 0.90:
+        return "name collision"
+    if facts > 0.50:
+        return "shared facts"
+    return None
+
+
+def _llm_compress_facts(facts: list[str], person_name: Optional[str]) -> list[str]:
+    """Semantic compression: send facts to an Ollama LLM and take its merged list.
+
+    Uses OLLAMA_URL (default http://localhost:11434/v1) and COMPRESS_MODEL
+    (default qwen3:8b). Returns an empty list on failure so the caller can
+    decide not to write.
+    """
+    from pydantic_ai import Agent as _Agent
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434/v1")
+    model_name = os.environ.get("COMPRESS_MODEL", "qwen3:8b")
+    provider = OpenAIProvider(base_url=ollama_url, api_key="ollama")
+    model = OpenAIChatModel(model_name, provider=provider)
+    agent = _Agent(
+        model,
+        output_type=list[str],
+        system_prompt=(
+            "You deduplicate and compress a list of facts about one person. "
+            "Output ONLY a JSON array of bare-predicate strings (no subject, "
+            "no person name, no pronouns like 'he'/'she'/'the person'). "
+            "Merge paraphrases. Preserve every unique piece of information. "
+            "Do not invent facts. Keep each item concise."
+        ),
+    )
+    subject = person_name or "the person"
+    joined = "\n".join(f"- {f}" for f in facts)
+    prompt = (
+        f"Facts about {subject}:\n{joined}\n\n"
+        "Return the deduplicated, canonical list."
+    )
+    try:
+        result = agent.run_sync(prompt)
+        out = result.output if isinstance(result.output, list) else []
+        return [s.strip() for s in out if isinstance(s, str) and s.strip()]
+    except Exception as e:
+        logger.error(f"LLM compress failed: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Standalone: inspect/manage people memory from CLI
 # ---------------------------------------------------------------------------
 
@@ -581,6 +797,24 @@ def main():
     fact_p = sub.add_parser("add-fact", help="Add a fact about a person")
     fact_p.add_argument("name")
     fact_p.add_argument("fact")
+    dedupe_p = sub.add_parser("dedupe",
+        help="Rule-based cleanup: strip subject prefixes, merge near-duplicates")
+    dedupe_p.add_argument("--person", help="Limit to one person_id (e.g. p001)")
+    dedupe_p.add_argument("--apply", action="store_true",
+        help="Write changes (without this, dry-run only)")
+    compress_p = sub.add_parser("compress",
+        help="LLM-based semantic compression via Ollama")
+    compress_p.add_argument("person", help="person_id or name")
+    compress_p.add_argument("--apply", action="store_true",
+        help="Write changes (without this, dry-run only)")
+    similar_p = sub.add_parser("similar",
+        help="Find people records that may be duplicates of each other")
+    similar_p.add_argument("--person",
+        help="Compare only this person_id against all others")
+    similar_p.add_argument("--db-dir", default="known_faces",
+        help="Face encoding database directory (default: known_faces)")
+    similar_p.add_argument("--all", action="store_true",
+        help="Show every pair, even ones below the verdict thresholds")
     sub.add_parser("shell", help="Interactive shell for poking at people memory")
 
     args = parser.parse_args()
@@ -638,6 +872,134 @@ def main():
             mem._active[0] = person
         mem.add_fact(0 if person.track_id == 0 else person.track_id, args.fact)
         print(f"Added fact about {args.name}: {args.fact}")
+
+    elif args.command == "dedupe":
+        pids = [args.person] if args.person else sorted(mem._stored.keys())
+        total_before = total_after = total_changes = 0
+        for pid in pids:
+            stored = mem._stored.get(pid)
+            if not stored:
+                print(f"  {pid}: not found")
+                continue
+            name = stored.get("name")
+            facts = list(stored.get("facts", []))
+            new_facts, changes = _dedupe_person_facts(facts, name)
+            total_before += len(facts)
+            total_after += len(new_facts)
+            total_changes += len(changes)
+            head = f"{pid} ({name or 'unnamed'}): {len(facts)} -> {len(new_facts)}"
+            if not changes:
+                print(f"{head}  (unchanged)")
+                continue
+            print(head)
+            for kind, a, b in changes:
+                if kind == "normalized":
+                    print(f"  ~ {a!r}")
+                    print(f"    -> {b!r}")
+                elif kind == "dropped":
+                    print(f"  - drop {a!r}")
+                    if b:
+                        print(f"    (merged into {b!r})")
+                elif kind == "replaced":
+                    print(f"  * replaced {a!r}")
+                    print(f"    with     {b!r}")
+            if args.apply:
+                stored["facts"] = new_facts
+                fpath = os.path.join(mem._dir, f"{pid}.json")
+                tmp = fpath + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(stored, f, indent=2, ensure_ascii=False)
+                os.replace(tmp, fpath)
+                print("  [written]")
+        suffix = "" if args.apply else "  (dry-run; pass --apply to write)"
+        print(f"\nTotal: {total_before} -> {total_after} facts, "
+              f"{total_changes} changes across {len(pids)} people.{suffix}")
+
+    elif args.command == "compress":
+        # Accept either person_id or name
+        person = mem.get_by_id(args.person) or mem.get_by_name(args.person)
+        if not person:
+            print(f"No person found for {args.person!r}")
+            return
+        pid = person.persistent_id
+        name = person.name
+        facts = list(person.facts)
+        if not facts:
+            print(f"{pid} ({name}): no facts to compress")
+            return
+        print(f"Compressing {len(facts)} facts for {pid} ({name}) via LLM...")
+        new_facts = _llm_compress_facts(facts, name)
+        if not new_facts:
+            print("LLM returned nothing; aborting.")
+            return
+        # Always run the rule-based dedup over the LLM output too, to
+        # catch any residual subjects/whitespace the model left behind.
+        new_facts, _ = _dedupe_person_facts(new_facts, name)
+        print(f"\nBefore ({len(facts)}):")
+        for f in facts:
+            print(f"  - {f}")
+        print(f"\nAfter ({len(new_facts)}):")
+        for f in new_facts:
+            print(f"  - {f}")
+        if args.apply:
+            stored = mem._stored.get(pid, {})
+            stored["facts"] = new_facts
+            mem._stored[pid] = stored
+            fpath = os.path.join(mem._dir, f"{pid}.json")
+            tmp = fpath + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(stored, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, fpath)
+            print(f"\n[written to {fpath}]")
+        else:
+            print("\n(dry-run; pass --apply to write)")
+
+    elif args.command == "similar":
+        pids = sorted(mem._stored.keys())
+        if not pids:
+            print("No people records.")
+            return
+        encs_by_pid = _load_face_encodings_by_person(args.db_dir)
+        if not encs_by_pid:
+            print(f"Warning: no face encodings loaded from {args.db_dir}/faces.pkl — "
+                  "falling back to name+facts only.")
+
+        def meta(pid):
+            s = mem._stored.get(pid, {})
+            return s.get("name"), list(s.get("facts", []))
+
+        focus = [args.person] if args.person else pids
+        shown = 0
+        for i, pid_a in enumerate(focus):
+            if pid_a not in mem._stored:
+                print(f"  {pid_a}: not found"); continue
+            name_a, facts_a = meta(pid_a)
+            encs_a = encs_by_pid.get(pid_a, [])
+            start = 0 if args.person else i + 1
+            for pid_b in pids[start:]:
+                if pid_b == pid_a:
+                    continue
+                name_b, facts_b = meta(pid_b)
+                encs_b = encs_by_pid.get(pid_b, [])
+                face_min, face_mean = _pair_face_distances(encs_a, encs_b)
+                name_sim = _name_similarity(name_a, name_b)
+                facts_sim = _facts_similarity(facts_a, facts_b)
+                verdict = _similarity_verdict(face_min, name_sim, facts_sim)
+                if verdict is None and not args.all:
+                    continue
+                shown += 1
+                face_txt = (f"{face_min:.2f}/{face_mean:.2f}"
+                            if face_min != float("inf") else "n/a")
+                label = verdict or "below thresholds"
+                print(f"{pid_a} ({name_a or '?'})  ~  {pid_b} ({name_b or '?'})")
+                print(f"  face min/mean: {face_txt}  "
+                      f"name: {name_sim:.2f}  facts: {facts_sim:.2f}  "
+                      f"-> {label}")
+        if shown == 0:
+            print("No suspicious pairs."
+                  " Use --all to see every pair regardless of threshold.")
+        else:
+            print(f"\n{shown} pair(s) shown.")
 
     elif args.command == "shell":
         from debug_shell import run_shell

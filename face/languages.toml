@@ -39,6 +39,16 @@ ask_name = [
 ]
 
 [languages.en.interview]
+favourite_candy = [
+    "Hi {name}! What's your favourite candy?",
+    "Hey {name}, got a favourite sweet?",
+    "Hello {name}! Any candy you can't resist?",
+]
+favourite_coffee = [
+    "Hi {name}! How do you like your coffee?",
+    "Hey {name}, what's your go-to coffee order?",
+    "Hello {name}! Got a favourite way to drink coffee?",
+]
 favourite_colour = [
     "Hi {name}! What's your favourite colour?",
     "Hey {name}, what colour do you like best?",
@@ -86,6 +96,16 @@ ask_name = [
 ]
 
 [languages.sv.interview]
+favourite_candy = [
+    "Hej {name}! Vilket är ditt favoritgodis?",
+    "Hejsan {name}, har du något favoritgodis?",
+    "Hej {name}! Vad är du för sorts godismänniska?",
+]
+favourite_coffee = [
+    "Hej {name}! Hur tar du ditt kaffe?",
+    "Hejsan {name}, vad är ditt favoritkaffe?",
+    "Hej {name}! Hur gillar du kaffet bäst?",
+]
 favourite_colour = [
     "Hej {name}! Vilken är din favoritfärg?",
     "Hejsan {name}, vilken färg gillar du bäst?",
