@@ -10,11 +10,14 @@ To change the agent's personality or add new generation methods,
 edit this file.
 """
 
+import json
 import time
 import random
 import asyncio
 import threading
 import logging
+import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -83,6 +86,7 @@ class ConversationLLM:
         model = OpenAIChatModel(model_name, provider=provider)
         self._model = model
         self._model_name = model_name
+        self._ollama_url = ollama_url
         self._mcp_servers = mcp_servers or []
         self._agent_name = agent_name
         self._smart_greetings = smart_greetings
@@ -107,6 +111,44 @@ class ConversationLLM:
         """Shut down the background event loop."""
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._loop_thread.join(timeout=5)
+
+    def validate(self) -> None:
+        """Verify the Ollama server is reachable and the model is installed.
+
+        Raises RuntimeError with a human-readable message on failure. Hits
+        the OpenAI-compatible /models endpoint and checks that
+        ``self._model_name`` is present.
+        """
+        url = self._ollama_url_for_validate()
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise RuntimeError(
+                f"Cannot reach Ollama at {url}: {e}. "
+                f"Is `ollama serve` running?") from e
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"Ollama at {url} returned invalid JSON: {e}") from e
+
+        installed = {m.get("id") for m in data.get("data", []) if m.get("id")}
+        if self._model_name in installed:
+            return
+        # Ollama tags may include a ":latest" suffix — accept either form.
+        alt = f"{self._model_name}:latest"
+        if alt in installed or self._model_name.split(":")[0] in {
+                m.split(":")[0] for m in installed}:
+            return
+        available = ", ".join(sorted(installed)) if installed else "(none)"
+        raise RuntimeError(
+            f"Ollama model {self._model_name!r} is not installed. "
+            f"Available: {available}. "
+            f"Pull it with: `ollama pull {self._model_name}`")
+
+    def _ollama_url_for_validate(self) -> str:
+        """Return the /models URL for the configured Ollama base URL."""
+        base = self._ollama_url.rstrip("/")
+        return f"{base}/models"
 
     def _make_agent(self) -> PydanticAgent:
         """Create a pydantic-ai agent with current system prompt + MCP toolsets."""

@@ -128,6 +128,7 @@ class VoiceOutput:
         self._voices: dict[str, PiperVoice] = {}
         self._model_lock = threading.Lock()  # protects _voices lazy loading
         self._ready = False
+        self._load_error: Optional[str] = None
         self._speaking = False
         self._stop_event = threading.Event()
         self._interrupted = False
@@ -146,6 +147,11 @@ class VoiceOutput:
     @property
     def ready(self) -> bool:
         return self._ready
+
+    @property
+    def load_error(self) -> Optional[str]:
+        """Error message from the last default-model load attempt, or None."""
+        return self._load_error
 
     @property
     def speaking(self) -> bool:
@@ -182,8 +188,10 @@ class VoiceOutput:
                        ModelLoadingPayload(model_name))
             model_path = os.path.join(self._model_dir, f"{model_name}.onnx")
             if not os.path.exists(model_path):
-                msg = (f"no model loaded: {model_name} not found at "
+                msg = (f"Piper model {model_name!r} not found at "
                        f"{model_path} — run download_models.py")
+                if model_name == self._default_model:
+                    self._load_error = msg
                 self._emit(TtsEventType.MODEL_LOAD_FAILED,
                            ModelLoadFailedPayload(model_name, msg))
                 logger.error(msg)
@@ -196,9 +204,12 @@ class VoiceOutput:
                            ModelReadyPayload(model_name))
                 logger.info(f"Piper TTS loaded: {model_name}")
             except Exception as e:
+                msg = f"Failed to load piper model {model_name}: {e}"
+                if model_name == self._default_model:
+                    self._load_error = msg
                 self._emit(TtsEventType.MODEL_LOAD_FAILED,
                            ModelLoadFailedPayload(model_name, str(e)))
-                logger.error(f"Failed to load piper model {model_name}: {e}")
+                logger.error(msg)
 
     def _get_voice(self, language: Optional[str] = None) -> Optional[PiperVoice]:
         """Return the PiperVoice for a language, or None if not loaded.

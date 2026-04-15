@@ -11,6 +11,7 @@ agent.py.  This file only handles:
 import cv2
 import numpy as np
 import os
+import sys
 import time
 import threading
 import logging
@@ -358,9 +359,16 @@ def main():
     tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector)
 
     voice_in = VoiceInput()
-    voice_in.load()
     voice_out = VoiceOutput(model_name=args.en_voice)
-    voice_out.load()
+    print("Loading speech models...")
+    voice_in.load_sync()
+    if voice_in.load_error:
+        print(f"ERROR: {voice_in.load_error}", file=sys.stderr)
+        sys.exit(1)
+    voice_out.load_sync()
+    if voice_out.load_error:
+        print(f"ERROR: {voice_out.load_error}", file=sys.stderr)
+        sys.exit(1)
 
     memory = PeopleMemory(storage_dir=args.people_dir)
     memory.load()
@@ -380,6 +388,11 @@ def main():
         agent_name=args.agent_name,
         smart_greetings=args.smart_greeting,
     )
+    try:
+        llm.validate()
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
     agent = Agent(
         tracker=tracker,
@@ -439,11 +452,6 @@ def main():
     agent.subscribe(on_agent_event)
 
     # --- Start agent ---
-    print("Loading models...")
-    while not voice_in.ready:
-        time.sleep(0.5)
-    while not voice_out.ready:
-        time.sleep(0.5)
     print("Models loaded. Starting agent.\n")
 
     agent.start()

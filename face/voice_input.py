@@ -467,6 +467,7 @@ class VoiceInput:
         self._vad_model = None
         self._loading = False
         self._ready = False
+        self._load_error: Optional[str] = None
         self._lock = threading.Lock()
 
         # Observable state (for GUI polling)
@@ -503,6 +504,11 @@ class VoiceInput:
     def loading(self) -> bool:
         return self._loading
 
+    @property
+    def load_error(self) -> Optional[str]:
+        """Error message from the last model load attempt, or None on success."""
+        return self._load_error
+
     # --- Lifecycle ---
 
     def load(self):
@@ -525,6 +531,9 @@ class VoiceInput:
                        ModelReadyPayload("whisper", f"{self._whisper_size} ({self._whisper_compute})"))
             logger.info("Whisper model loaded.")
         except Exception as e:
+            self._load_error = (
+                f"Failed to load whisper model {self._whisper_size!r} "
+                f"({self._whisper_compute}): {e}")
             self._emit(VoiceEventType.MODEL_LOAD_FAILED,
                        ModelLoadFailedPayload("whisper", str(e)))
             logger.error(f"Failed to load whisper: {e}")
