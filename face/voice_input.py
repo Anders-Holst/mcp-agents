@@ -525,9 +525,12 @@ class VoiceInput:
         self._emit(VoiceEventType.MODEL_LOADING, ModelLoadingPayload("whisper"))
         try:
             logger.info(f"Loading whisper model ({self._whisper_size})...")
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            compute_type = self._whisper_compute if device == "cuda" else "int8"
             self._whisper_model = WhisperModel(self._whisper_size,
-                                               compute_type=self._whisper_compute,
-                                               device="cuda")
+                                               compute_type=compute_type,
+                                               device=device)
             self._emit(VoiceEventType.MODEL_READY,
                        ModelReadyPayload("whisper", f"{self._whisper_size} ({self._whisper_compute})"))
             logger.info("Whisper model loaded.")

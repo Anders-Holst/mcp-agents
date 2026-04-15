@@ -40,6 +40,11 @@ _SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Agent event types
 # ---------------------------------------------------------------------------
 
+class SpeakMode(Enum):
+    SIMPLE = "simple"   # pause mic while speaking, no AEC
+    AEC = "aec"         # full-duplex with echo cancellation + barge-in
+
+
 class AgentEventType(Enum):
     GREETING = auto()           # agent decided to greet someone
     GOODBYE = auto()            # agent said goodbye when someone left
@@ -140,7 +145,8 @@ class Agent:
                  ask_name_cooldown_s: float = 30.0,
                  min_frames_before_ask: int = 3,
                  auto_ask: bool = True,
-                 auto_greet: bool = True):
+                 auto_greet: bool = True,
+                 speak_mode: SpeakMode = SpeakMode.SIMPLE):
         self.tracker = tracker
         self.voice_in = voice_input
         self.voice_out = voice_output
@@ -153,6 +159,7 @@ class Agent:
         self.auto_ask = auto_ask
         self.auto_greet = auto_greet
         self._audio_monitor = audio_monitor
+        self.speak_mode = speak_mode
 
         self._busy = False
         self._busy_lock = threading.Lock()
@@ -183,6 +190,45 @@ class Agent:
         # Subscribe to face events
         self.tracker.subscribe(self._on_face_event)
 
+        # Watchdog: force-clears stale _busy, dumps thread stacks, and
+        # resumes the listener. Runs every 5s on a daemon thread.
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, daemon=True, name="agent-watchdog")
+        self._watchdog_thread.start()
+
+    def _watchdog_loop(self):
+        import faulthandler, sys
+        while not self._watchdog_stop.wait(5.0):
+            with self._busy_lock:
+                if not self._busy or self._busy_since <= 0:
+                    continue
+                elapsed = time.time() - self._busy_since
+                if elapsed <= self._busy_timeout:
+                    continue
+                reason = self._busy_reason
+                self._busy = False
+                self._busy_reason = ""
+                self._busy_since = 0
+            logger.error(
+                f"[WATCHDOG] busy stuck {elapsed:.0f}s (reason={reason!r}) — "
+                f"force-clearing; dumping thread stacks")
+            try:
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            except Exception as e:
+                logger.warning(f"[WATCHDOG] traceback dump failed: {e}")
+            try:
+                if self._echo_detector is not None:
+                    self._echo_detector.stop()
+                    self._echo_detector = None
+            except Exception as e:
+                logger.warning(f"[WATCHDOG] echo stop failed: {e}")
+            try:
+                self.voice_out.speaking = False
+                self.resume_listening()
+            except Exception as e:
+                logger.warning(f"[WATCHDOG] resume failed: {e}")
+
     def subscribe(self, callback: AgentEventCallback,
                   event_types: Optional[set] = None) -> Callable[[], None]:
         return self._dispatcher.subscribe(callback, event_types)
@@ -200,6 +246,7 @@ class Agent:
 
     def stop(self):
         """Stop continuous listening and clean up."""
+        self._watchdog_stop.set()
         if self._listener:
             self._listener.stop()
             # Cancel any blocking listen() so the thread exits promptly
@@ -249,6 +296,19 @@ class Agent:
             self._listener.paused = False
             self.state = "LISTENING"
 
+    def set_speak_mode(self, mode):
+        if isinstance(mode, str):
+            try:
+                mode = SpeakMode(mode.lower())
+            except ValueError:
+                raise ValueError(
+                    f"unknown speak mode {mode!r}; use "
+                    f"{[m.value for m in SpeakMode]}")
+        if mode == SpeakMode.AEC:
+            self._aec_failures = 0
+            self._aec_disabled = False
+        self.speak_mode = mode
+
     # --- Manual actions ---
 
     def speak(self, text: str, language: str = None):
@@ -262,9 +322,9 @@ class Agent:
         Falls back to simple output-only playback if the AEC stream fails.
         """
         self.pause_listening()
-        if self._aec_disabled:
-            aec_ok = False
-        else:
+        use_aec = (self.speak_mode == SpeakMode.AEC) and not self._aec_disabled
+        aec_ok = False
+        if use_aec:
             aec_ok = self._speak_aec(text, language)
             if not aec_ok:
                 self._aec_failures += 1

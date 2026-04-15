@@ -36,6 +36,7 @@ Agent commands (only when running inside the agent):
   greet <track_id>           Force a greeting (triggers interview question)
   ask <track_id>             Force asking for a name
   speak <text>               Speak text via TTS
+  speak-mode [simple|aec]    Show or set TTS mode (default: simple)
   status                     Show agent busy/listener state (for debugging)
   pause / resume             Pause/resume speech listening
   reset                      Unstick the agent (clear busy, resume listener)
@@ -126,15 +127,37 @@ def run_shell(mem: PeopleMemory, agent: Optional[object] = None):
             names = sorted(mem.known_names)
             if not names:
                 print("(no people)")
-            for name in names:
-                person = mem.get_by_name(name)
-                bits = [name]
-                if person and person.times_seen > 1:
-                    bits.append(f"seen {person.times_seen}x")
-                missing = person.missing_topics() if person else []
-                if missing:
-                    bits.append(f"{len(missing)} topic(s) not asked")
-                print("  " + ", ".join(bits))
+            else:
+                header = (f"  {'ID':<6} {'Name':<18} {'Seen':>5}  "
+                          f"{'Last seen':<19} {'Facts':>5} {'Lang':<4} Topics?")
+                print(header)
+                print("  " + "-" * (len(header) - 2))
+                rows = []
+                for name in names:
+                    person = mem.get_by_name(name)
+                    if not person:
+                        continue
+                    last = person.last_seen_dt()
+                    last_str = last.strftime("%Y-%m-%d %H:%M:%S") if last else "-"
+                    missing = person.missing_topics() or []
+                    topics_str = (f"{len(missing)} pending"
+                                  if missing else "all asked")
+                    rows.append((
+                        person.last_seen or 0.0,
+                        person.persistent_id or "-",
+                        name,
+                        person.times_seen,
+                        last_str,
+                        len(person.facts),
+                        person.last_language or "-",
+                        topics_str,
+                    ))
+                # Most recently seen first
+                rows.sort(key=lambda r: r[0], reverse=True)
+                for (_, pid, name, seen, last_str, n_facts,
+                     lang, topics_str) in rows:
+                    print(f"  {pid:<6} {name[:18]:<18} {seen:>5}  "
+                          f"{last_str:<19} {n_facts:>5} {lang:<4} {topics_str}")
         elif cmd == "show":
             name = resolve_name(parts)
             if name:
@@ -248,6 +271,15 @@ def run_shell(mem: PeopleMemory, agent: Optional[object] = None):
         elif agent and cmd == "speak" and len(parts) >= 2:
             text = line.split(maxsplit=1)[1]
             agent.speak(text)
+        elif agent and cmd == "speak-mode":
+            if len(parts) < 2:
+                print(f"speak_mode = {agent.speak_mode.value}")
+            else:
+                try:
+                    agent.set_speak_mode(parts[1])
+                    print(f"speak_mode -> {agent.speak_mode.value}")
+                except ValueError as e:
+                    print(e)
         elif agent and cmd == "status":
             print("--- Agent ---")
             busy = agent._busy
@@ -271,6 +303,7 @@ def run_shell(mem: PeopleMemory, agent: Optional[object] = None):
 
             print("--- TTS ---")
             vo = agent.voice_out
+            print(f"  mode:        {agent.speak_mode.value}")
             print(f"  speaking:    {vo.speaking}")
             print(f"  ready:       {vo.ready}")
             print(f"  interrupted: {vo.interrupted}")
