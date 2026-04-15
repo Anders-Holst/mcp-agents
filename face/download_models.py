@@ -5,25 +5,12 @@ import os
 import sys
 import urllib.request
 
+from languages_config import get_language_models
+
 _SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 PIPER_MODEL_DIR = os.path.join(_SOURCE_DIR, "piper_models")
 
-
-def _load_models_from_config() -> dict[str, str]:
-    """Load language -> tts_model mapping from languages.toml."""
-    try:
-        import tomllib
-    except ModuleNotFoundError:
-        import tomli as tomllib
-    config_path = os.path.join(os.path.dirname(__file__), "languages.toml")
-    with open(config_path, "rb") as f:
-        config = tomllib.load(f)
-    return {lang: cfg["tts_model"]
-            for lang, cfg in config.get("languages", {}).items()
-            if "tts_model" in cfg}
-
-
-MODELS = _load_models_from_config()
+MODELS = get_language_models()
 
 
 def _piper_download_url(model_name: str) -> str:

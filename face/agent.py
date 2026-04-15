@@ -28,7 +28,8 @@ import numpy as np
 from voice_input import VoiceInput, AudioMonitor, ContinuousListener, EchoDetector
 from voice_output import VoiceOutput
 from people_memory import PeopleMemory
-from llm import ConversationLLM, get_goodbye
+from llm import ConversationLLM
+from languages_config import get_goodbye
 
 logger = logging.getLogger("agent")
 

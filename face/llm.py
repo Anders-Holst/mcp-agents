@@ -10,7 +10,6 @@ To change the agent's personality or add new generation methods,
 edit this file.
 """
 
-import os
 import time
 import random
 import asyncio
@@ -27,48 +26,9 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
 from people_memory import PeopleMemory
+from languages_config import get_language_config
 
 logger = logging.getLogger("llm")
-
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Canned greeting templates (used when smart_greetings=False)
-# ---------------------------------------------------------------------------
-
-def _load_language_config(path: str = None) -> dict:
-    """Load languages.toml and return the parsed dict."""
-    if path is None:
-        path = os.path.join(os.path.dirname(__file__), "languages.toml")
-    try:
-        import tomllib
-    except ModuleNotFoundError:
-        import tomli as tomllib  # Python < 3.11
-    with open(path, "rb") as f:
-        return tomllib.load(f)
-
-_LANG_CONFIG = _load_language_config()
-_DEFAULT_LANG = _LANG_CONFIG.get("default", "en")
-_LANGUAGES = _LANG_CONFIG.get("languages", {})
-
-def _get_lang(lang: str) -> dict:
-    """Return the config block for a language, falling back to default."""
-    return _LANGUAGES.get(lang, _LANGUAGES.get(_DEFAULT_LANG, {}))
-
-def get_language_models() -> dict[str, str]:
-    """Return {lang_code: tts_model_name} from the config."""
-    return {lang: cfg["tts_model"] for lang, cfg in _LANGUAGES.items()
-            if "tts_model" in cfg}
-
-def get_goodbye(name: str, language: str = "en") -> str:
-    """Return a random goodbye phrase for the given language."""
-    cfg = _get_lang(language)
-    goodbyes = cfg.get("goodbyes", _get_lang(_DEFAULT_LANG).get("goodbyes", []))
-    if goodbyes:
-        return random.choice(goodbyes).format(name=name)
-    return f"Goodbye, {name}!"
 
 
 SYSTEM_PROMPT = """\
@@ -235,15 +195,15 @@ Emotion: {emotion or 'neutral'}"""
                          interview_topic: Optional[str],
                          language: str = "en") -> str:
         """Pick a random template for the given situation and language."""
-        cfg = _get_lang(language)
-        greetings = cfg.get("greetings", _get_lang(_DEFAULT_LANG).get("greetings", []))
+        cfg = get_language_config(language)
+        greetings = cfg.get("greetings", get_language_config().get("greetings", []))
         if name == "someone":
             return random.choice(greetings).format(name=name) if greetings else f"Hello {name}!"
         if interview_topic:
             interview = cfg.get("interview", {})
             options = interview.get(interview_topic)
             if not options:
-                options = _get_lang(_DEFAULT_LANG).get("interview", {}).get(interview_topic)
+                options = get_language_config().get("interview", {}).get(interview_topic)
             if options:
                 return random.choice(options).format(name=name)
         return random.choice(greetings).format(name=name) if greetings else f"Hello {name}!"
@@ -417,8 +377,8 @@ If nothing new was revealed, say "Nothing new." """
 
     def generate_ask_name(self, track_id: int, language: str = "en") -> str:
         """Return a random 'what's your name?' prompt. Always canned."""
-        cfg = _get_lang(language)
-        prompts = cfg.get("ask_name", _get_lang(_DEFAULT_LANG).get("ask_name", []))
+        cfg = get_language_config(language)
+        prompts = cfg.get("ask_name", get_language_config().get("ask_name", []))
         return random.choice(prompts) if prompts else "Hello! What's your name?"
 
     def extract_name(self, person_said: str) -> Optional[str]:

@@ -13,6 +13,7 @@ Can be run standalone:
 
 import collections
 import os
+import re
 import time
 import threading
 import logging
@@ -34,16 +35,13 @@ _SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 PIPER_MODEL_DIR = os.path.join(_SOURCE_DIR, "piper_models")
 PIPER_MODEL_NAME = "en_US-lessac-medium"
 
-# Language models loaded from languages.toml (with hardcoded fallback)
-def _load_language_models() -> dict[str, str]:
-    try:
-        from llm import get_language_models
-        return get_language_models()
-    except Exception:
-        return {"en": "en_US-lessac-medium"}
+from languages_config import (
+    get_language_models, get_language_pronunciations, get_default_language,
+)
 
-LANGUAGE_MODELS = _load_language_models()
-DEFAULT_LANGUAGE = "en"
+LANGUAGE_MODELS = get_language_models()
+DEFAULT_LANGUAGE = get_default_language()
+LANG_PRONUNCIATIONS = get_language_pronunciations()
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +76,7 @@ class ModelLoadFailedPayload:
 @dataclass(frozen=True)
 class TtsStartedPayload:
     text: str
+    tts_text: Optional[str] = None  # phonetic text if pronunciations were applied
 
 
 @dataclass(frozen=True)
@@ -124,6 +123,7 @@ class VoiceOutput:
         self._model_dir = model_dir
         self._default_model = model_name
         self._language_models = dict(language_models or LANGUAGE_MODELS)
+        self._lang_pron = LANG_PRONUNCIATIONS
         # Loaded PiperVoice instances keyed by model name
         self._voices: dict[str, PiperVoice] = {}
         self._model_lock = threading.Lock()  # protects _voices lazy loading
@@ -219,6 +219,16 @@ class VoiceOutput:
                 self._load_model(model_name)
         return self._voices.get(model_name)
 
+    # --- Pronunciation ---
+
+    def _apply_pronunciations(self, text: str, language: Optional[str]) -> str:
+        """Replace words with phonetic spellings for better TTS output."""
+        if language and language in self._lang_pron:
+            for word, replacement in self._lang_pron[language].items():
+                text = re.sub(rf"\b{re.escape(word)}\b", replacement,
+                              text, flags=re.IGNORECASE)
+        return text
+
     # --- Core ---
 
     @property
@@ -251,9 +261,11 @@ class VoiceOutput:
             self._speaking = True
             self._interrupted = False
             self._stop_event.clear()
+            tts_text = self._apply_pronunciations(text, language)
             start = time.time()
-            self._emit(TtsEventType.TTS_STARTED, TtsStartedPayload(text))
-            self._play(text, voice)
+            self._emit(TtsEventType.TTS_STARTED,
+                       TtsStartedPayload(text, tts_text if tts_text != text else None))
+            self._play(tts_text, voice)
             duration = time.time() - start
             self._emit(TtsEventType.TTS_FINISHED,
                        TtsFinishedPayload(text, duration))
@@ -325,11 +337,14 @@ class VoiceOutput:
 def main():
     parser = argparse.ArgumentParser(description="Standalone voice output (TTS)")
     parser.add_argument("text", nargs="?", help="Text to speak (omit for interactive)")
-    parser.add_argument("--model-dir", default=PIPER_MODEL_DIR)
-    parser.add_argument("--model-name", default=PIPER_MODEL_NAME)
     parser.add_argument("--language", "-l", default=None,
                         choices=sorted(LANGUAGE_MODELS.keys()),
                         help=f"Language code (one of: {', '.join(sorted(LANGUAGE_MODELS.keys()))})")
+    parser.add_argument("--model-dir", default=PIPER_MODEL_DIR)
+    parser.add_argument("--model-name", default=None,
+                        help="Override Piper model name (default: from --language)")
+    parser.add_argument("--no-pronunciations", "-P", action="store_true",
+                        help="Disable pronunciation replacements")
     parser.add_argument("--interactive", action="store_true",
                         help="Interactive mode: type text, press Enter to speak")
     args = parser.parse_args()
@@ -338,12 +353,27 @@ def main():
                         format="%(asctime)s [%(levelname)s] %(message)s",
                         datefmt="%H:%M:%S")
 
-    tts = VoiceOutput(model_dir=args.model_dir, model_name=args.model_name)
+    # Validate language
+    if args.language and args.language not in LANGUAGE_MODELS:
+        print(f"Unknown language: {args.language}  "
+              f"(available: {', '.join(sorted(LANGUAGE_MODELS))})")
+        return
+
+    # Resolve model name: explicit --model-name > language lookup > default
+    model_name = args.model_name
+    if model_name is None:
+        model_name = LANGUAGE_MODELS.get(args.language, PIPER_MODEL_NAME)
+
+    tts = VoiceOutput(model_dir=args.model_dir, model_name=model_name)
+    if args.no_pronunciations:
+        tts._lang_pron = {}
 
     def on_event(event: TtsEvent):
         ts = datetime.now().strftime("%H:%M:%S")
         if event.type == TtsEventType.TTS_STARTED:
             print(f"  [{ts}] Speaking: \"{event.payload.text}\"")
+            if event.payload.tts_text:
+                print(f"  [{ts}] Pronounce: \"{event.payload.tts_text}\"")
         elif event.type == TtsEventType.TTS_FINISHED:
             print(f"  [{ts}] Done ({event.payload.duration_s:.1f}s)")
         elif event.type == TtsEventType.MODEL_READY:
@@ -357,15 +387,17 @@ def main():
         print("Failed to load TTS model.")
         return
 
+    language = args.language
+
     if args.text and not args.interactive:
-        tts.speak(args.text, language=args.language)
+        tts.speak(args.text, language=language)
     else:
         print("Type text and press Enter to speak. Ctrl+C to quit.\n")
         try:
             while True:
                 text = input("> ")
                 if text.strip():
-                    tts.speak(text.strip(), language=args.language)
+                    tts.speak(text.strip(), language=language)
         except (KeyboardInterrupt, EOFError):
             pass
 
