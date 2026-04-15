@@ -285,6 +285,46 @@ class PeopleMemory:
         self._save(person)
         return person_id
 
+    def register_enrolled(self, track_id: int, person_id: str) -> Person:
+        """Attach a freshly enrolled (but unnamed) person_id to a track.
+
+        Called when the face tracker auto-saves a new face and emits
+        FACE_ENROLLED. The encoding is already on disk in the face DB;
+        here we just create the matching in-memory record so the agent
+        can accumulate dialogues/facts keyed by ``person_id`` while the
+        name is still unknown. No JSON is written until a name is set
+        (``is_identified`` is False without a real name).
+        """
+        person = self.get_or_create(track_id)
+        if person.persistent_id == person_id:
+            return person
+        person.persistent_id = person_id
+        with self._lock:
+            self._stored.setdefault(person_id, {
+                "persistent_id": person_id,
+                "name": None,
+            })
+        logger.info(f"Registered enrolled face {person_id!r} for track {track_id}")
+        return person
+
+    def set_name(self, track_id: int, name: str) -> Optional[str]:
+        """Attach a display name to the active person for this track.
+
+        If the track already has a ``persistent_id`` (typical after auto
+        enrollment), saves the full record. Otherwise allocates a new
+        person_id. Returns the person_id or None on failure.
+        """
+        person = self.get_or_create(track_id)
+        if person.persistent_id:
+            person.name = name
+            logger.info(
+                f"Set name {name!r} on {person.persistent_id} "
+                f"(track {track_id})"
+            )
+            self._save(person)
+            return person.persistent_id
+        return self.create_person(track_id, name)
+
     # --- Lookup by track_id ---
 
     def get(self, track_id: int) -> Optional[Person]:
@@ -306,17 +346,19 @@ class PeopleMemory:
             return self._active[track_id]
 
     def identify(self, track_id: int, person_id: str):
-        """Link a track_id to an existing stored person by ID.
+        """Link a track_id to a stored person by ID.
 
         Loads the JSON record, uses its stored ``name`` as the display
         name, and restores facts / asked_topics / dialogues. If no JSON
-        exists for ``person_id`` this is a no-op — use ``create_person``
-        for new people.
+        exists for ``person_id``, treats it as an enrolled-but-unnamed
+        person (the face tracker auto-saves encodings before a name is
+        learned, so the tracker may report a person_id we've never
+        written to disk).
         """
         with self._lock:
             stored = self._stored.get(person_id)
         if not stored:
-            logger.warning(f"identify: no stored record for {person_id!r}")
+            self.register_enrolled(track_id, person_id)
             return
 
         person = self.get_or_create(track_id)

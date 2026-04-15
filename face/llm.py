@@ -338,15 +338,7 @@ If nothing new was revealed, say "Nothing new." """
         def set_name(ctx: RunContext[ConversationDeps], name: str) -> str:
             """Update the person's name if they corrected or stated it."""
             logger.info(f"[TOOL:set_name] {name}")
-            # Re-read person_id from live object — _try_learn_name may
-            # have created the person concurrently.
-            person = ctx.deps.memory.get(ctx.deps.track_id)
-            pid = (person.persistent_id if person else None) or ctx.deps.person_id
-            if pid:
-                ctx.deps.memory.rename(pid, name)
-            else:
-                # New person — create a persistent record
-                ctx.deps.memory.create_person(ctx.deps.track_id, name)
+            ctx.deps.memory.set_name(ctx.deps.track_id, name)
             return "Name updated."
 
         return agent

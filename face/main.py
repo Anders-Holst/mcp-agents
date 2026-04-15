@@ -524,8 +524,13 @@ def main():
                         existing = (existing_name, tracker.get_confidence(primary.track_id))
                     name = get_name_from_gui(frame, existing)
                     if name:
-                        person_id = memory.create_person(primary.track_id, name)
-                        tracker.learn_face(primary.track_id, person_id, frame)
+                        # Prefer the auto-enrolled pid if one already exists;
+                        # set_name handles both "rename existing" and
+                        # "allocate new" paths. Also add an extra encoding
+                        # sample from this frame for better recognition.
+                        person_id = memory.set_name(primary.track_id, name)
+                        if person_id:
+                            tracker.learn_face(primary.track_id, person_id, frame)
                         event_log.add("face", f"Manually learned: {name} ({person_id})")
 
             elif key == ord("t"):

@@ -170,9 +170,6 @@ class Agent:
         self._greeted: dict[str, float] = {}      # person_id -> timestamp
         self._asked: dict[int, float] = {}         # track_id -> timestamp
 
-        # Pending frame for learn_face after name is captured
-        self._pending_frame: Optional[tuple[int, object]] = None
-
         # Echo detector reference — exposed for UI drawing
         self._echo_detector: Optional[EchoDetector] = None
 
@@ -380,10 +377,10 @@ class Agent:
             echo.stop()
             self._echo_detector = None
 
-    def ask_name(self, track_id: int, frame=None):
+    def ask_name(self, track_id: int):
         """Manually trigger asking an unknown face for their name."""
         threading.Thread(target=self._do_ask_name,
-                         args=(track_id, frame), daemon=True).start()
+                         args=(track_id,), daemon=True).start()
 
     def greet(self, track_id: int):
         """Manually trigger greeting a known face."""
@@ -408,6 +405,15 @@ class Agent:
             self._handle_identity_confirmed(event)
         elif event.type == FaceEventType.FACE_APPEARED:
             self._handle_face_appeared(event)
+        elif event.type == FaceEventType.FACE_ENROLLED:
+            self._handle_face_enrolled(event)
+
+    def _handle_face_enrolled(self, event: FaceEvent):
+        """Tracker auto-saved a new face — register it in memory."""
+        tid = event.track_id
+        pid = event.payload.person_id
+        logger.info(f"[AGENT] FACE_ENROLLED: track={tid} person_id={pid}")
+        self.memory.register_enrolled(tid, pid)
 
     def _handle_identity_confirmed(self, event: FaceEvent):
         """A face was just identified — update memory and greet."""
@@ -480,14 +486,21 @@ class Agent:
     # --- Periodic check for unknown faces (called from outside or a timer) ---
 
     def check_unknown_faces(self, frame=None):
-        """Check if any visible unknown faces should be asked for their name."""
+        """Check if any visible unnamed people should be asked for their name.
+
+        Auto-enrollment means the tracker saves an encoding for every new
+        face on its own, so here we iterate by what ``memory`` knows —
+        the unnamed placeholder persons registered on FACE_ENROLLED.
+        ``frame`` is accepted for backwards compatibility but ignored.
+        """
         if not self.auto_ask or self._busy:
             return
         if not self.voice_in.ready or not self.voice_out.ready:
             return
 
         for face in self.tracker.get_visible_faces():
-            if self.tracker.is_recognized(face.track_id):
+            person = self.memory.get(face.track_id)
+            if not person or person.is_identified:
                 continue
             if face.frames_visible < self._min_frames_ask:
                 continue
@@ -498,7 +511,7 @@ class Agent:
 
             self._asked[tid] = now
             threading.Thread(target=self._do_ask_name,
-                             args=(tid, frame), daemon=True).start()
+                             args=(tid,), daemon=True).start()
             break  # one at a time
 
     # --- Speech handler ---
@@ -618,13 +631,14 @@ class Agent:
             self._clear_busy()
             self.resume_listening()
 
-    def _do_ask_name(self, track_id: int, frame=None):
-        """Ask an unknown face for their name.
+    def _do_ask_name(self, track_id: int):
+        """Ask an unnamed face for their name.
 
         Speaks the question via TTS, then returns — the continuous
         listener picks up the response and ``_on_heard_speech`` handles
-        name extraction for unidentified people. Stores ``frame`` so
-        learn_face can be called later.
+        name extraction for unidentified people. The face encoding is
+        already saved by the tracker (auto-enroll), so no frame needs
+        to be stashed.
         """
         with self._busy_lock:
             if self._busy:
@@ -638,8 +652,6 @@ class Agent:
             ))
 
             self.memory.add_dialogue(track_id, "system", ask_text)
-            # Store the frame so we can learn the face when they tell us their name
-            self._pending_frame = (track_id, frame)
             self.speak(ask_text)
 
         finally:
@@ -659,14 +671,7 @@ class Agent:
             track_id=track_id, name=extracted, raw_speech=person_said,
         ))
 
-        person_id = self.memory.create_person(track_id, extracted)
-
-        # Learn the face if we have a pending frame for this track
-        pending = self._pending_frame
-        if pending and pending[0] == track_id and pending[1] is not None:
-            self.tracker.learn_face(track_id, person_id, pending[1])
-            self._pending_frame = None
-
+        person_id = self.memory.set_name(track_id, extracted)
         logger.info(f"[AGENT] learned name {extracted!r} for track {track_id} ({person_id})")
 
     def _extract_facts(self, track_id: int, person_said: str):

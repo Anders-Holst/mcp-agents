@@ -23,6 +23,7 @@ import face_recognition
 import numpy as np
 import os
 import pickle
+import re
 import time
 import threading
 import logging
@@ -59,6 +60,7 @@ class FaceEventType(Enum):
     IDENTITY_LOST = auto()        # named -> unknown
     IDENTITY_CHANGED = auto()     # name A -> name B
     FACE_LEARNED = auto()         # learn_face() called
+    FACE_ENROLLED = auto()        # new unknown face auto-saved with fresh person_id
     FOCUS_CHANGED = auto()        # primary focus switched
     EMOTION_CHANGED = auto()      # emotion label changed
 
@@ -118,6 +120,12 @@ class FaceLearnedPayload:
 
 
 @dataclass(frozen=True)
+class FaceEnrolledPayload:
+    person_id: str
+    bbox: tuple
+
+
+@dataclass(frozen=True)
 class FocusChangedPayload:
     old_track_id: Optional[int]
     new_track_id: int
@@ -137,8 +145,8 @@ class EmotionChangedPayload:
 FaceEventPayload = Union[
     FaceAppearedPayload, FaceDisappearedPayload, FaceOccludedPayload,
     FaceRecoveredPayload, IdentityConfirmedPayload, IdentityLostPayload,
-    IdentityChangedPayload, FaceLearnedPayload, FocusChangedPayload,
-    EmotionChangedPayload,
+    IdentityChangedPayload, FaceLearnedPayload, FaceEnrolledPayload,
+    FocusChangedPayload, EmotionChangedPayload,
 ]
 
 
@@ -376,7 +384,9 @@ class FaceTracker:
                  recognition_revoke_seconds: float = 0.25,
                  focus_switch_threshold: float = 0.1,
                  focus_switch_seconds: float = 0.5,
-                 emotion_debounce_seconds: float = 0.3):
+                 emotion_debounce_seconds: float = 0.3,
+                 auto_enroll: bool = True,
+                 enroll_min_frames: int = 10):
         self.db = db
         self.emotion_detector = emotion_detector
         self.frame_scale = frame_scale
@@ -386,9 +396,12 @@ class FaceTracker:
         self._confirm_s = recognition_confirm_seconds
         self._revoke_s = recognition_revoke_seconds
         self._emotion_debounce_s = emotion_debounce_seconds
+        self._auto_enroll = auto_enroll
+        self._enroll_min_frames = enroll_min_frames
 
         self._tracks: list[TrackedFace] = []
         self._identities: dict[int, Identity] = {}
+        self._last_frames: dict[int, np.ndarray] = {}
         self._next_id = 1
         self._lock = threading.Lock()
         self._skip_frame = False
@@ -512,6 +525,7 @@ class FaceTracker:
             for track in lost:
                 ident = self._identities.pop(track.track_id, None)
                 self._emotion_stable.pop(track.track_id, None)
+                self._last_frames.pop(track.track_id, None)
                 pending.append(self._make_event(
                     FaceEventType.FACE_DISAPPEARED, track.track_id,
                     FaceDisappearedPayload(
@@ -540,6 +554,10 @@ class FaceTracker:
                         initial_confidence=ident.confidence if ident else 0.0,
                     )
                 ))
+
+            # --- Auto-enroll stable unknown faces ---
+            if self._auto_enroll:
+                pending.extend(self._auto_enroll_unknown())
 
             # --- Identity change events ---
             for track_id, old_pid, new_pid, new_conf in identity_changes:
@@ -636,6 +654,44 @@ class FaceTracker:
             FaceLearnedPayload(person_id=person_id)
         ))
         return True
+
+    def _allocate_person_id(self) -> str:
+        """Pick the next free pNNN id by scanning the face database."""
+        max_n = 0
+        for pid in self.db.known_person_ids:
+            m = re.match(r"^p(\d+)$", pid)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+        return f"p{max_n + 1:03d}"
+
+    def _auto_enroll_unknown(self) -> list[FaceEvent]:
+        """Save any visible, unrecognized, stable faces to the face DB.
+
+        Caller must hold self._lock. Returns events to be dispatched after
+        the lock is released.
+        """
+        events = []
+        for track in self._tracks:
+            if track.track_id in self._identities:
+                continue
+            if not track.is_visible:
+                continue
+            if track.frames_visible < self._enroll_min_frames:
+                continue
+            frame = self._last_frames.get(track.track_id)
+            if frame is None:
+                continue
+            person_id = self._allocate_person_id()
+            self.db.add_face(person_id, track.encoding, frame, track.bbox)
+            self._identities[track.track_id] = Identity(
+                person_id=person_id, confidence=100.0,
+                _matching_since=0.0, _confirmed=True,
+            )
+            events.append(self._make_event(
+                FaceEventType.FACE_ENROLLED, track.track_id,
+                FaceEnrolledPayload(person_id=person_id, bbox=track.bbox),
+            ))
+        return events
 
     @property
     def active_tracks(self) -> list[TrackedFace]:
@@ -812,6 +868,7 @@ class FaceTracker:
         track.last_seen = now
         track.frames_visible += 1
         track.frames_since_seen = 0
+        self._last_frames[track.track_id] = frame
 
         top, right, bottom, left = bbox
         face_roi = frame[top:bottom, left:right]
@@ -832,6 +889,7 @@ class FaceTracker:
             first_seen=now, last_seen=now, frames_visible=1,
         )
         self._next_id += 1
+        self._last_frames[track.track_id] = frame
 
         top, right, bottom, left = bbox
         face_roi = frame[top:bottom, left:right]
@@ -935,6 +993,7 @@ _EVENT_SHORT_NAMES = {
     "IDENTITY_LOST": "ID LOST",
     "IDENTITY_CHANGED": "ID CHANGE",
     "FACE_LEARNED": "LEARNED",
+    "FACE_ENROLLED": "ENROLLED",
     "FOCUS_CHANGED": "FOCUS",
     "EMOTION_CHANGED": "EMOTION",
 }
@@ -948,6 +1007,7 @@ _EVENT_COLORS = {
     "IDENTITY_LOST": (120, 120, 255),
     "IDENTITY_CHANGED": (220, 220, 120),
     "FACE_LEARNED": (255, 255, 120),
+    "FACE_ENROLLED": (255, 200, 255),
     "FOCUS_CHANGED": (120, 220, 255),
     "EMOTION_CHANGED": (220, 140, 255),
 }
