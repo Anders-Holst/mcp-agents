@@ -101,6 +101,8 @@ ask_name = [
 ]
 
 [languages.sv.pronunciations]
+godis = "goo-this"
+favoritgodis = "favoritgoo-this"
 Niclas = "Niklas"
 Riesen = "Risen"
 robot = "robått"
