@@ -28,7 +28,9 @@ from llm import ConversationLLM
 # Logging
 # ---------------------------------------------------------------------------
 
-LOG_DIR = "logs"
+_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+LOG_DIR = os.path.join(_SOURCE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"face_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
@@ -328,8 +330,8 @@ def draw_faces(frame, tracker, memory):
 
 def main():
     parser = argparse.ArgumentParser(description="Face Agent UI")
-    parser.add_argument("--db-dir", default="known_faces")
-    parser.add_argument("--people-dir", default="people")
+    parser.add_argument("--db-dir", default=os.path.join(_SOURCE_DIR, "known_faces"))
+    parser.add_argument("--people-dir", default=os.path.join(_SOURCE_DIR, "people"))
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--no-auto-ask", action="store_true")

@@ -10,6 +10,7 @@ Can be run standalone with face_tracker + voice_input + voice_output:
     python agent.py [--no-voice] [--no-auto-ask]
 """
 
+import os
 import time
 import threading
 import logging
@@ -31,6 +32,7 @@ from llm import ConversationLLM, get_goodbye
 
 logger = logging.getLogger("agent")
 
+_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
 # Agent event types
@@ -764,8 +766,8 @@ def _draw_echo_state(frame, agent):
 
 def main():
     parser = argparse.ArgumentParser(description="Standalone agent")
-    parser.add_argument("--db-dir", default="known_faces")
-    parser.add_argument("--people-dir", default="people")
+    parser.add_argument("--db-dir", default=os.path.join(_SOURCE_DIR, "known_faces"))
+    parser.add_argument("--people-dir", default=os.path.join(_SOURCE_DIR, "people"))
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--no-auto-ask", action="store_true")
@@ -961,7 +963,7 @@ def main():
         pass
 
     # Force-exit on second Ctrl+C if cleanup hangs
-    import signal, os
+    import signal
     signal.signal(signal.SIGINT, lambda *_: os._exit(1))
 
     print("\nShutting down...")

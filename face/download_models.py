@@ -5,7 +5,8 @@ import os
 import sys
 import urllib.request
 
-PIPER_MODEL_DIR = "piper_models"
+_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+PIPER_MODEL_DIR = os.path.join(_SOURCE_DIR, "piper_models")
 
 
 def _load_models_from_config() -> dict[str, str]:
