@@ -46,19 +46,6 @@ LANGUAGE_MODELS = _load_language_models()
 DEFAULT_LANGUAGE = "en"
 
 
-def _piper_download_url(model_name: str) -> str:
-    """Derive the HuggingFace download URL from a piper model name.
-    E.g. 'sv_SE-nst-medium' -> .../sv/sv_SE/nst/medium/sv_SE-nst-medium.onnx
-    """
-    parts = model_name.split("-")  # ['sv_SE', 'nst', 'medium']
-    lang_region = parts[0]         # 'sv_SE'
-    lang = lang_region.split("_")[0]  # 'sv'
-    speaker = parts[1]             # 'nst'
-    quality = parts[2] if len(parts) > 2 else "medium"
-    base = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
-    return f"{base}/{lang}/{lang_region}/{speaker}/{quality}/"
-
-
 # ---------------------------------------------------------------------------
 # Event types and payloads
 # ---------------------------------------------------------------------------
@@ -183,8 +170,9 @@ class VoiceOutput:
         self._load_model(self._default_model)
 
     def _load_model(self, model_name: str):
-        """Load a single piper model by name (downloads if needed).
+        """Load a single piper model by name from disk.
 
+        Never downloads — run `python download_models.py` beforehand.
         Thread-safe: uses _model_lock to prevent duplicate loads.
         """
         with self._model_lock:
@@ -192,9 +180,15 @@ class VoiceOutput:
                 return
             self._emit(TtsEventType.MODEL_LOADING,
                        ModelLoadingPayload(model_name))
+            model_path = os.path.join(self._model_dir, f"{model_name}.onnx")
+            if not os.path.exists(model_path):
+                msg = (f"no model loaded: {model_name} not found at "
+                       f"{model_path} — run download_models.py")
+                self._emit(TtsEventType.MODEL_LOAD_FAILED,
+                           ModelLoadFailedPayload(model_name, msg))
+                logger.error(msg)
+                return
             try:
-                self._ensure_model(model_name)
-                model_path = os.path.join(self._model_dir, f"{model_name}.onnx")
                 logger.info(f"Loading piper model: {model_name}...")
                 self._voices[model_name] = PiperVoice.load(model_path)
                 self._ready = True
@@ -206,30 +200,24 @@ class VoiceOutput:
                            ModelLoadFailedPayload(model_name, str(e)))
                 logger.error(f"Failed to load piper model {model_name}: {e}")
 
-    def _ensure_model(self, model_name: str):
-        os.makedirs(self._model_dir, exist_ok=True)
-        model_path = os.path.join(self._model_dir, f"{model_name}.onnx")
-        config_path = model_path + ".json"
-        if not os.path.exists(model_path):
-            import urllib.request
-            base_url = _piper_download_url(model_name)
-            logger.info(f"Downloading piper model: {model_name}...")
-            urllib.request.urlretrieve(
-                base_url + f"{model_name}.onnx", model_path)
-            urllib.request.urlretrieve(
-                base_url + f"{model_name}.onnx.json", config_path)
-            logger.info("Piper model downloaded.")
+    def _get_voice(self, language: Optional[str] = None) -> Optional[PiperVoice]:
+        """Return the PiperVoice for a language, or None if not loaded.
 
-    def _get_voice(self, language: Optional[str] = None) -> PiperVoice:
-        """Return the PiperVoice for a language, lazy-loading if needed."""
+        Never downloads. Falls back to the default model if the requested
+        language's model is not available on disk.
+        """
         model_name = self._language_models.get(
             language, self._default_model) if language else self._default_model
         if model_name not in self._voices:
             self._load_model(model_name)
-        # Fall back to default if the requested model failed to load
         if model_name not in self._voices:
+            logger.warning(
+                f"no model loaded for language={language!r} "
+                f"({model_name}); falling back to default")
             model_name = self._default_model
-        return self._voices[model_name]
+            if model_name not in self._voices:
+                self._load_model(model_name)
+        return self._voices.get(model_name)
 
     # --- Core ---
 
@@ -339,6 +327,9 @@ def main():
     parser.add_argument("text", nargs="?", help="Text to speak (omit for interactive)")
     parser.add_argument("--model-dir", default=PIPER_MODEL_DIR)
     parser.add_argument("--model-name", default=PIPER_MODEL_NAME)
+    parser.add_argument("--language", "-l", default=None,
+                        choices=sorted(LANGUAGE_MODELS.keys()),
+                        help=f"Language code (one of: {', '.join(sorted(LANGUAGE_MODELS.keys()))})")
     parser.add_argument("--interactive", action="store_true",
                         help="Interactive mode: type text, press Enter to speak")
     args = parser.parse_args()
@@ -367,14 +358,14 @@ def main():
         return
 
     if args.text and not args.interactive:
-        tts.speak(args.text)
+        tts.speak(args.text, language=args.language)
     else:
         print("Type text and press Enter to speak. Ctrl+C to quit.\n")
         try:
             while True:
                 text = input("> ")
                 if text.strip():
-                    tts.speak(text.strip())
+                    tts.speak(text.strip(), language=args.language)
         except (KeyboardInterrupt, EOFError):
             pass
 
