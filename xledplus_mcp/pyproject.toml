@@ -3,7 +3,7 @@ name = "xledplus_mcp"
 version = "0.1.0"
 description = "An MCP-server to control a Twinkly LED light string."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "fastmcp>=2.3.4",
     "xled_plus",

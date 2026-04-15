@@ -3,7 +3,7 @@ name = "mcpclient_text"
 version = "0.1.0"
 description = "Generic LLM-based MCP-client"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "openai",
     "fastmcp>=2.3.4",

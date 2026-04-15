@@ -3,7 +3,7 @@ name = "dirgera-mcp"
 version = "0.1.0"
 description = "Dirigera MCP Server for IoT control"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 
 dependencies = [
     "dirigera>=1.2.2",
