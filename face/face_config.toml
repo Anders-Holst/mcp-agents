@@ -1,0 +1,5 @@
+[tracker]
+# Grace period (seconds) before a missing face becomes FACE_DISAPPEARED.
+# Brief head-turns / occlusions within this window emit FACE_OCCLUDED /
+# FACE_RECOVERED instead.
+max_missing_seconds = 3.0

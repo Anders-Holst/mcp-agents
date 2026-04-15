@@ -565,9 +565,11 @@ async def main():
                 print(f'\n  Response: {reply_text}  (lang={lang})')
                 set_win_state('talk')
                 if reply_text:
+                    # Simple TTS: pause mic for the whole utterance, no AEC.
+                    # Resume is handled by the state-machine transition below.
                     listener.paused = True
-                    #voice_out.speak(reply_text, lang)
-                    speak(reply_text, lang)
+                    voice_out.speak(reply_text, lang)
+                    time.sleep(0.5)  # let room reverb decay before mic reopens
                 if state['newstate'] is None or state['newstate']=='listen':
                     set_state(state, 'listen')
 
