@@ -17,6 +17,7 @@ Can be run standalone:
     python face_tracker.py [--db-dir known_faces] [--camera 0]
 """
 
+import copy
 import cv2
 import face_recognition
 import numpy as np
@@ -1061,6 +1062,70 @@ def main():
     frame_min_interval = 1.0 / args.fps if args.fps > 0 else 0
     last_frame_time = 0.0
 
+    # --- Detector runs on its own thread; main thread handles capture + display. ---
+    state_lock = threading.Lock()
+    stats_lock = threading.Lock()
+    pending_frame = [None]
+    frame_signal = threading.Event()
+    stop_event = threading.Event()
+    latest = {
+        "faces": [],           # list[TrackedFace] snapshot (copies, safe to read)
+        "identities": {},      # track_id -> (person_id, confidence)
+        "focus_id": None,
+        "result_id": 0,
+        "process_ms": 0.0,
+        "result_time": 0.0,
+    }
+    stats = {
+        "captured": 0,
+        "submitted": 0,
+        "processed": 0,
+        "dropped": 0,
+        "display_frames": 0,
+        "display_reused": 0,
+        "detector_busy_s": 0.0,
+    }
+
+    def detector_worker():
+        local_result_id = 0
+        while not stop_event.is_set():
+            frame_signal.wait(timeout=0.1)
+            frame_signal.clear()
+            with state_lock:
+                work = pending_frame[0]
+                pending_frame[0] = None
+            if work is None:
+                continue
+            t0 = time.time()
+            faces = tracker.process_frame(work)
+            elapsed_ms = (time.time() - t0) * 1000.0
+            faces_snap = [copy.copy(f) for f in faces]
+            idents = {}
+            for f in faces_snap:
+                pid = tracker.get_person_id(f.track_id)
+                if pid is not None:
+                    idents[f.track_id] = (pid, tracker.get_confidence(f.track_id))
+            focus_id_local = tracker.focus_track_id
+            local_result_id += 1
+            with state_lock:
+                latest["faces"] = faces_snap
+                latest["identities"] = idents
+                latest["focus_id"] = focus_id_local
+                latest["result_id"] = local_result_id
+                latest["process_ms"] = elapsed_ms
+                latest["result_time"] = time.time()
+            with stats_lock:
+                stats["processed"] += 1
+                stats["detector_busy_s"] += elapsed_ms / 1000.0
+
+    worker = threading.Thread(target=detector_worker, daemon=True, name="face-detector")
+    worker.start()
+
+    hud_text = ""
+    hud_last_time = time.time()
+    hud_last_snapshot = dict(stats)
+    prev_displayed_result_id = -1
+
     logger.info(f"Controls: L=learn  TAB=select  D=delete-db  Q=quit | FPS cap: {args.fps or 'unlimited'}")
 
     while True:
@@ -1078,9 +1143,35 @@ def main():
         ret, frame = cap.read()
         if not ret:
             break
+        with stats_lock:
+            stats["captured"] += 1
 
-        faces = tracker.process_frame(frame)
-        visible = [f for f in faces if f.is_visible]
+        # Handoff: overwrite pending slot. If something was already waiting, that's a drop.
+        with state_lock:
+            dropped_here = pending_frame[0] is not None
+            pending_frame[0] = frame
+        frame_signal.set()
+        with stats_lock:
+            stats["submitted"] += 1
+            if dropped_here:
+                stats["dropped"] += 1
+
+        # Snapshot the latest detector result for this display frame.
+        with state_lock:
+            faces_snap = latest["faces"]
+            idents_snap = latest["identities"]
+            focus_id = latest["focus_id"]
+            result_id = latest["result_id"]
+            process_ms = latest["process_ms"]
+            result_time = latest["result_time"]
+
+        with stats_lock:
+            stats["display_frames"] += 1
+            if result_id == prev_displayed_result_id:
+                stats["display_reused"] += 1
+        prev_displayed_result_id = result_id
+
+        visible = [f for f in faces_snap if f.is_visible]
 
         if selected_track_id is not None:
             if not any(f.track_id == selected_track_id for f in visible):
@@ -1088,8 +1179,7 @@ def main():
         elif visible:
             selected_track_id = visible[0].track_id
 
-        focus_id = tracker.focus_track_id
-        focus_face = tracker.get_face_by_id(focus_id) if focus_id else None
+        focus_face = next((f for f in faces_snap if f.track_id == focus_id), None) if focus_id else None
         focus_is_ghost = focus_face is not None and not focus_face.is_visible
 
         if focus_is_ghost and focus_face:
@@ -1103,7 +1193,8 @@ def main():
             for i in range(0, bottom - top, 12):
                 cv2.line(frame, (left, top + i), (left, top + min(i + 6, bottom - top)), ghost_color, 2)
                 cv2.line(frame, (right, top + i), (right, top + min(i + 6, bottom - top)), ghost_color, 2)
-            pid = tracker.get_person_id(focus_face.track_id)
+            ghost_pid_conf = idents_snap.get(focus_face.track_id)
+            pid = ghost_pid_conf[0] if ghost_pid_conf else None
             ghost_label = f"FOCUS (lost {elapsed:.1f}s)"
             if pid:
                 ghost_label = f"{pid} - {ghost_label}"
@@ -1113,8 +1204,9 @@ def main():
         for rank, face in enumerate(visible):
             is_focus = (face.track_id == focus_id)
             is_selected = (face.track_id == selected_track_id)
-            pid = tracker.get_person_id(face.track_id)
-            conf = tracker.get_confidence(face.track_id)
+            pid_conf = idents_snap.get(face.track_id)
+            pid = pid_conf[0] if pid_conf else None
+            conf = pid_conf[1] if pid_conf else 0.0
             top, right, bottom, left = face.bbox
 
             if is_focus:
@@ -1167,8 +1259,32 @@ def main():
             cv2.putText(frame, info, (left + 6, bottom + 48),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
 
+        # Recompute HUD at ~1 Hz from counter deltas.
+        now_t = time.time()
+        dt_hud = now_t - hud_last_time
+        if dt_hud >= 1.0:
+            with stats_lock:
+                snap = dict(stats)
+            d_cap = snap["captured"] - hud_last_snapshot["captured"]
+            d_proc = snap["processed"] - hud_last_snapshot["processed"]
+            d_sub = snap["submitted"] - hud_last_snapshot["submitted"]
+            d_drop = snap["dropped"] - hud_last_snapshot["dropped"]
+            d_disp = snap["display_frames"] - hud_last_snapshot["display_frames"]
+            drop_pct = (100.0 * d_drop / d_sub) if d_sub else 0.0
+            stale_ms = max(0.0, (now_t - result_time) * 1000.0) if result_time else 0.0
+            hud_text = (
+                f"cap {d_cap/dt_hud:4.1f}fps  det {d_proc/dt_hud:4.1f}fps  "
+                f"disp {d_disp/dt_hud:4.1f}fps  drop {drop_pct:4.0f}%  "
+                f"proc {process_ms:5.0f}ms  stale {stale_ms:4.0f}ms"
+            )
+            hud_last_time = now_t
+            hud_last_snapshot = snap
+
         status = f"Tracks: {len(visible)} | Known: {len(face_db.known_person_ids)} | DB: {face_db.encoding_count} encodings"
         cv2.putText(frame, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        if hud_text:
+            cv2.putText(frame, hud_text, (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (180, 255, 180), 1, cv2.LINE_AA)
         cv2.putText(frame, "L=learn  TAB=select  D=delete-db  Q=quit",
                     (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
 
@@ -1207,8 +1323,26 @@ def main():
             if confirm == ord("y"):
                 face_db.clear()
 
+    stop_event.set()
+    frame_signal.set()
+    worker.join(timeout=2.0)
     cap.release()
     cv2.destroyAllWindows()
+
+    with stats_lock:
+        final = dict(stats)
+    sub = final["submitted"] or 1
+    disp = final["display_frames"] or 1
+    avg_proc_ms = (final["detector_busy_s"] * 1000.0 / final["processed"]) if final["processed"] else 0.0
+    logger.info(
+        "Pipeline stats: captured=%d submitted=%d processed=%d dropped=%d (%.1f%%) "
+        "display=%d reused=%d (%.1f%%) avg_proc=%.1fms",
+        final["captured"], final["submitted"], final["processed"], final["dropped"],
+        100.0 * final["dropped"] / sub,
+        final["display_frames"], final["display_reused"],
+        100.0 * final["display_reused"] / disp,
+        avg_proc_ms,
+    )
     logger.info("Done.")
 
 
