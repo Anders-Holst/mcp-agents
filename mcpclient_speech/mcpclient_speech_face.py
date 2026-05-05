@@ -44,6 +44,7 @@ default_lang = "sv"
 messages_trunclen = 8
 messages = []
 state = {'evtime': 0, 'statetime': 0, 'newstate': None, 'currstate': None}
+omit_names_and_prefs = False
 
 has_sysprompt = False
 has_sysprompt_lang = False
@@ -126,7 +127,7 @@ def on_face_change(id):
     if curr_person:
         print("(Storing current person)")
         curr_person.lasttime = time.time()
-        if curr_person.lastmessages is not messages: # Does this work? I try to see if anything new has been said, otherwise there is no point extracting again. If there are many switches between people.
+        if not omit_names_and_prefs and curr_person.lastmessages is not messages: # Does this work? I try to see if anything new has been said, otherwise there is no point extracting again. If there are many switches between people.
             curr_person.lastmessages = messages
             info = distill_user_info(extract_dialog_messages(messages))
             name = extract_value("Name:", info)
@@ -251,6 +252,13 @@ def language_message(lang):
     msg = f"Reply in {reply_language}!"
     return {"role": "system", "content": msg}
 
+def greet_prompt_noname():
+    if curr_person.lasttime is None:
+        return {'role':'user', 'content':'There is a new person in front of you. Produce a suitable greeting.'}
+    else:
+        duration = int((time.time() - curr_person.lasttime) / 60)
+        return {'role':'user', 'content': f'A person has appeared in front of you. It was {duration} minutes since you last met. Produce a suitable greeting.'}
+   
 def greet_prompt():
     if not curr_person.name and not curr_person.lasttime:
         return {'role':'user', 'content':'There is a new person in front of you. Produce a greeting and ask for the name.'}
@@ -523,7 +531,10 @@ async def main():
                     print("\n  User: (", lang, ") ", prompt)
                     messages.append(user_message(prompt))
                 elif newstate == 'greet':
-                    greetprompt = greet_prompt()
+                    if omit_names_and_prefs:
+                        greetprompt = greet_prompt_noname()
+                    else:
+                        greetprompt = greet_prompt()
                     print("\n  Greeting:", greetprompt['content'])
                     messages.append(greetprompt)
 
@@ -589,6 +600,8 @@ async def main():
                     time.sleep(0.5)  # let room reverb decay before mic reopens
                 if state['newstate'] is None or state['newstate']=='listen':
                     set_state(state, 'listen')
+                else:
+                    state['currstate'] = None
 
                 newstate = False
     
